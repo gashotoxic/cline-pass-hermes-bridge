@@ -6,3 +6,4 @@ __pycache__/
 *.tmp
 # Local test evidence
 hermes-test*.log
+SETUP-REPORT.md

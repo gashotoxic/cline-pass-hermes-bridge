@@ -1,213 +1,204 @@
-# ClinePass → Hermes Agent: OAuth Subscription Bridge
+# ClinePass OAuth Bridge for Hermes Agent
 
-> ## Quick start (fresh machine)
->
-> ```powershell
-> git clone https://github.com/gashotoxic/cline-pass-hermes-bridge.git
-> cd cline-pass-hermes-bridge
->
-> # 1. Sign in with the Cline CLI (browser OAuth - creates the tokens we reuse)
-> npm install -g cline
-> cline auth cline            # choose your ClinePass account
->
-> # 2. Start the bridge (auto-refreshes the OAuth token, serves :8317/v1)
-> .\Start-Bridge.ps1          # add -Install once to auto-start at logon
->
-> # 3. Point any OpenAI-compatible client at it
-> #    base_url: http://127.0.0.1:8317/v1   api_key: anything (dummy)
-> ```
->
-> Hermes Agent example: add to `config.yaml` under `custom_providers`:
-> ```yaml
->   - name: cline-pass
->     base_url: http://127.0.0.1:8317/v1
->     api_key: bridge-managed-oauth   # dummy; real OAuth token is injected by the bridge
->     model: cline-pass/kimi-k3
->     api_mode: chat_completions
-> ```
-> then: `hermes -z "hello" --provider custom:cline-pass -m cline-pass/kimi-k3`
->
-> Requires: Windows, Python 3.8+ (stdlib only), Cline CLI signed in with an
-> active ClinePass subscription. Linux/macOS work too — set
-> `CLINE_PROVIDERS_JSON` if your Cline data dir differs.
->
-> ---
->
+Use your **ClinePass subscription** with [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+— or any OpenAI-compatible client — through the **Cline CLI's OAuth login**.
+No API key is created, copied, or stored anywhere.
 
+A tiny localhost bridge reuses the OAuth session that `cline auth cline` already
+created on your machine, keeps the access token fresh, and exposes a standard
+OpenAI-compatible endpoint at `http://127.0.0.1:8317/v1`.
 
-**Goal.** Use a **ClinePass subscription** (Cline's $9.99/mo plan for open coding
-models) with the **Hermes Agent** CLI — via the subscription's **OAuth login**,
-*not* an API key — following the same pattern as
-[`opencode-google-antigravity-auth`](https://github.com/shekohex/opencode-google-antigravity-auth)
-/ `antigravity-claude-proxy`, including automatic recovery when auth fails.
+## Features
 
-**Status: working and verified end-to-end** (2026-07-20). Hermes replied
-`HERMES VIA CLINEPASS OK` through the bridge using model `cline-pass/kimi-k3`.
+- **OAuth, not API keys** — reuses your existing Cline CLI sign-in (WorkOS AuthKit)
+- **Automatic token refresh** — access tokens live only 1 hour; the bridge refreshes
+  them via WorkOS before every request and writes rotated tokens back so the Cline
+  CLI keeps working too
+- **Failure resilience** — 401 → force refresh + retry; 429/5xx → backoff retry;
+  clear re-login instructions if the refresh token is ever revoked
+- **Watchdog script** — `Start-Bridge.ps1` heals the bridge and can auto-start it
+  at logon; Hermes can fail over to a backup model if the bridge is down
+- **Zero dependencies** — Python 3.8+ standard library only. No `pip install`
+- **Streaming + tool calling** — full SSE passthrough, works with Hermes tools
 
----
+> [!CAUTION]
+> Using a subscription's OAuth session outside the vendor's own client may be
+> against the provider's Terms of Service. This project only *reads* the tokens
+> your own Cline CLI created. Review Cline's terms and use at your own discretion.
 
-## Architecture
+## Requirements
 
-```
-┌──────────────┐   OpenAI-compatible    ┌─────────────────────────┐   Bearer workos:<JWT>   ┌──────────────────────┐
-│ Hermes Agent │ ─────────────────────► │ cline_pass_bridge.py    │ ──────────────────────► │ api.cline.bot        │
-│ custom prov. │  http://127.0.0.1:8317 │ localhost OAuth bridge  │  /api/v1/chat/completions│ (ClinePass backend) │
-└──────────────┘                        └──────────┬──────────────┘                         └──────────────────────┘
-                                                   │ reads / writes back                            ▲
-                                                   ▼                                                │ refresh_token grant
-                                        ~/.cline/data/settings/                     ┌───────────────┴──────────┐
-                                        providers.json  (tokens) ◄────────────────► │ WorkOS user_management   │
-                                                   ▲                                │ /authenticate            │
-                                                   │ written by                     └──────────────────────────┘
-                                        `cline auth cline` (browser OAuth, one time)
-```
-
-* The **Cline CLI** performs the browser OAuth flow (WorkOS AuthKit) and stores
-  `accessToken` / `refreshToken` / `expiresAt` in
-  `C:\Users\ADMIN\.cline\data\settings\providers.json` (provider `cline-pass`).
-* The **bridge** (this folder) reads those tokens, keeps the access token fresh
-  (WorkOS tokens live **1 hour**), and forwards Hermes' requests to
-  `https://api.cline.bot/api/v1/chat/completions`.
-* **Hermes** sees a plain OpenAI-compatible endpoint at
-  `http://127.0.0.1:8317/v1` — the `api_key` in its config is a dummy; the real
-  auth is injected by the bridge from the OAuth store.
-
----
-
-## Key findings from the investigation (why it is built this way)
-
-1. **ClinePass auth = WorkOS OAuth.** Signing in with `cline auth cline` stores
-   a WorkOS-issued RS256 JWT in `providers.json`. The JWT's `iss` is
-   `https://api.workos.com/user_management/client_01K3A541FN8TA3EPPHTD2325AR`.
-2. **Access tokens expire after 1 hour** (`exp - iat = 3600`). A static copy of
-   the token in Hermes would die within the hour → a refresh bridge is
-   mandatory. Refresh = `POST https://api.workos.com/user_management/authenticate`
-   with `{grant_type: "refresh_token", client_id, refresh_token}`. The client_id
-   is public and is read out of the JWT payload itself. Refresh tokens **rotate**
-   on every use, so the bridge writes the new pair back to `providers.json`
-   (with a timestamped backup) so the Cline CLI keeps working too.
-3. **`api.cline.bot` requires a `workos:` prefix on the bearer token.**
-   The CLI stores the token as `workos:eyJhbG...`. Sending the raw JWT gives
-   `401 Unauthorized`. The bridge normalizes this on every read and write.
-   (This cost one debugging round — the raw-JWT attempt failed with 401.)
-4. **The Cline API is OpenAI-compatible**: `POST /api/v1/chat/completions`,
-   SSE streaming, tool calling, `provider/model` model IDs. ClinePass models
-   use IDs like `cline-pass/kimi-k3` and `cline-pass/glm-5.2` (the same IDs the
-   Cline CLI stores in its config). `GET /api/v1/models` returns 404, so the
-   bridge serves a synthetic `/v1/models` built from the Cline config.
-5. **Hermes supports custom OpenAI-compatible providers** natively via
-   `custom_providers` in `C:\Users\ADMIN\AppData\Local\hermes\config.yaml`
-   (`name`, `base_url`, `api_key`, `model`, `api_mode: chat_completions`), and
-   an automatic `fallback_model` used on 429/529/503/connection errors.
-
----
-
-## Files in this folder
-
-| File | Purpose |
+| Requirement | Check |
 |---|---|
-| `cline_pass_bridge.py` | The bridge. Stdlib-only Python 3, no pip installs. |
-| `Start-Bridge.ps1` | Launcher + watchdog: no-op if healthy; otherwise restarts the bridge, forces a token refresh, and tells you when a manual re-login is needed. `-Install` registers a logon Scheduled Task (`ClinePassHermesBridge`). |
-| `bridge.log` | Runtime log (requests, refreshes, retries). |
-| `stdout.log` / `stderr.log` | Process output when started with redirected streams. |
-| `hermes-test.log` | Proof of the end-to-end test (`HERMES VIA CLINEPASS OK`). |
-| `README.md` | This report. |
+| Windows (Linux/macOS work via env override) | — |
+| Python 3.8+ | `python --version` |
+| Cline CLI with a **ClinePass** subscription | `npm install -g cline` |
+| Signed in once | `cline auth cline` |
 
-## Daily use
+## Setup
 
-1. **Start the bridge** (once per boot, or auto-start if installed):
-   ```powershell
-   H:\cline-pass-hermes-bridge\Start-Bridge.ps1
-   ```
-2. **Use it from Hermes**:
-   ```powershell
-   # one-shot
-   hermes -z "your prompt" --provider custom:cline-pass -m cline-pass/kimi-k3
-   # or pick it interactively
-   hermes model
-   ```
-   To make ClinePass the *default* model, set in `hermes model` (or config.yaml):
-   `model.default: cline-pass/kimi-k3`, `model.provider: cline-pass`,
-   `model.base_url: http://127.0.0.1:8317/v1`.
-3. **Health check**: `curl http://127.0.0.1:8317/health`
-   → `{"ok": true, "email": "...", "expires_in_seconds": ...}`
+**1. Sign in with the Cline CLI** (browser opens; pick your ClinePass account):
 
-## What was changed on this machine
-
-1. `C:\Users\ADMIN\AppData\Local\hermes\config.yaml` (backup:
-   `config.yaml.bak.bridge_<timestamp>` in the same folder):
-   * added `custom_providers` entry `cline-pass` → `http://127.0.0.1:8317/v1`
-     with dummy key `bridge-managed-oauth`, model `cline-pass/kimi-k3`;
-   * added an active `fallback_model` (xiaomi `mimo-v2.5-pro`, key from
-     `.env` `XIAOMI_API_KEY`) so Hermes fails over automatically if the
-     bridge is down or ClinePass errors (429/529/503/connection).
-2. `providers.json` (Cline CLI) gets its `cline-pass`/`cline` token triple
-   (`accessToken`, `refreshToken`, `expiresAt`) rewritten by the bridge on
-   every refresh; a `providers.json.bak.<timestamp>` backup is kept next to it.
-
-## Failure handling (the "if it fails" part)
-
-| Failure | What happens |
-|---|---|
-| Access token expired | Bridge refreshes silently via WorkOS before forwarding. |
-| Upstream 401 | Bridge force-refreshes once and retries the request. |
-| Upstream 429/5xx | Bridge retries with backoff (1s → 2s → 4s). |
-| Bridge down / unreachable | Hermes' `fallback_model` (xiaomi) takes over automatically. |
-| Refresh token rejected (revoked / logged out elsewhere) | Bridge returns a JSON `auth_error` telling you to run `cline auth cline`. `Start-Bridge.ps1` prints the same hint. After re-login the bridge picks up the new tokens automatically (it re-reads the file on change) — no restart needed. |
-| Machine reboot | Re-run `Start-Bridge.ps1`, or install the logon task once: `Start-Bridge.ps1 -Install`. |
-
-Useful manual commands:
 ```powershell
-python H:\cline-pass-hermes-bridge\cline_pass_bridge.py --check         # token status
-python H:\cline-pass-hermes-bridge\cline_pass_bridge.py --refresh-now   # force refresh
-Get-Content H:\cline-pass-hermes-bridge\bridge.log -Tail 20 -Wait       # live log
+cline auth cline
 ```
 
+This stores OAuth tokens in `~/.cline/data/settings/providers.json`. You never
+touch them — the bridge does.
 
----
+**2. Clone and start the bridge:**
 
-## How this was set up (step-by-step record)
+```powershell
+git clone https://github.com/gashotoxic/cline-pass-hermes-bridge.git
+cd cline-pass-hermes-bridge
+.\Install.ps1            # checks prerequisites, starts the bridge
+# optional, auto-start at every logon:
+.\Start-Bridge.ps1 -Install
+```
 
-1. **Identified the moving parts.** Hermes Agent (NousResearch) lives at
-   `%LOCALAPPDATA%\hermes` with `config.yaml` + `auth.json`; Cline CLI 3.0.46
-   (npm global) stores OAuth state under `~\.cline\data\`.
-2. **Read the reference implementation** (`opencode-google-antigravity-auth`):
-   same idea — reuse a first-party OAuth login in a third-party agent, with
-   automatic token refresh and endpoint fallback.
-3. **Found the existing ClinePass session** in
-   `~\.cline\data\settings\providers.json`: provider `cline-pass` with a WorkOS
-   access token (`workos:`-prefixed JWT), refresh token, 1-hour expiry, and the
-   model IDs `cline-pass/kimi-k3`, `cline-pass/glm-5.2`.
-4. **Verified the API shape** from docs.cline.bot: OpenAI-compatible
-   `POST https://api.cline.bot/api/v1/chat/completions`, Bearer auth; account
-   OAuth tokens are accepted (same as the CLI uses).
-5. **Proved the token works** with a direct REST call (200 OK, cost 0 under the
-   ClinePass subscription).
-6. **Built the bridge** (`cline_pass_bridge.py`): token store + WorkOS refresh
-   + atomic write-back + OpenAI-compatible proxy with retry/fallback logic.
-7. **Debugged the one real gotcha**: refreshed tokens were rejected with 401
-   because `api.cline.bot` requires the `workos:` prefix that the CLI stores.
-   Fixed by always persisting/sending the prefix (verified: prefixed → 200).
-8. **Tested**: `--check`, `--refresh-now` (rotation + write-back), `/health`,
-   `/v1/models`, non-streaming and SSE-streaming chat completions — all pass.
-9. **Wired Hermes**: `custom_providers` entry + `fallback_model` failover;
-   validated the YAML with Hermes' own venv Python.
-10. **End-to-end proof**: `hermes -z "Reply with exactly: HERMES VIA CLINEPASS OK"
-    --provider custom:cline-pass -m cline-pass/kimi-k3` → output exactly
-    `HERMES VIA CLINEPASS OK` (see `hermes-test.log`; bridge log shows the 200).
+You should see:
 
-## Security notes
+```
+Bridge started and healthy.
+```
 
-* OAuth tokens never leave this machine except to `api.workos.com` (refresh)
-  and `api.cline.bot` (inference). The bridge binds to `127.0.0.1` only.
-* No tokens or API keys are written into this README; they remain in the
-  tools' own stores (`providers.json`, `config.yaml`, `.env`).
-* Note: `config.yaml` / `providers.json` contain plaintext credentials — keep
-  them out of backups/shares. Consider rotating the chutes/cloudflare keys if
-  this machine's logs have been shared.
-* Heads-up on terms of service: using a subscription's OAuth session outside
-  the vendor's own client can be against the provider's ToS (the Antigravity
-  plugin README carries the same warning, and there are reports of account
-  enforcement for that service). Using your own ClinePass session with a local
-  client is your call — review Cline's terms and use at your own discretion.
+Verify: `curl http://127.0.0.1:8317/health` → `{"ok": true, ...}`
+
+**3. Add the provider to Hermes** — edit
+`%LOCALAPPDATA%\hermes\config.yaml` (Hermes home: `~/.hermes/config.yaml` on
+Linux/macOS) under `custom_providers`:
+
+```yaml
+custom_providers:
+  - name: cline-pass
+    base_url: http://127.0.0.1:8317/v1
+    api_key: bridge-managed-oauth   # dummy value; the bridge injects real auth
+    model: cline-pass/kimi-k3
+    api_mode: chat_completions
+```
+
+**4. Use it:**
+
+```powershell
+hermes -z "Refactor this function" --provider custom:cline-pass -m cline-pass/kimi-k3
+```
+
+Or run `hermes model` to make ClinePass your default model.
+
+### Optional: automatic failover
+
+If the bridge is down or ClinePass rate-limits, Hermes can fall back to another
+provider automatically:
+
+```yaml
+fallback_model:
+  provider: openrouter            # any provider Hermes supports
+  model: anthropic/claude-sonnet-4
+```
+
+## How It Works
+
+```
+Hermes (custom provider)          cline_pass_bridge.py                api.cline.bot
+        │   POST /v1/chat/completions      │                                ▲
+        │ ───────────────────────────────► │  Bearer workos:<access_token>  │
+        │                                  │ ──────────────────────────────►│
+        │   SSE stream / JSON              │                                │
+        │ ◄─────────────────────────────── │ ◄──────────────────────────────│
+                                           │   refresh_token grant (hourly)
+        ~/.cline/data/settings/            │ ──────────────────────────────► WorkOS
+        providers.json  ◄── read + write ──┘        /user_management/authenticate
+```
+
+1. `cline auth cline` performs the browser OAuth flow (WorkOS). Tokens are stored
+   by the Cline CLI — this project never asks you for credentials.
+2. WorkOS access tokens expire after **1 hour**. The bridge checks expiry before
+   every request and refreshes with the `refresh_token` grant when needed.
+   Refresh tokens rotate, so new tokens are written back to `providers.json`
+   (with a timestamped backup) to keep the Cline CLI signed in as well.
+3. Requests are forwarded to `https://api.cline.bot/api/v1/chat/completions`
+   unchanged — streaming, tool calls, and reasoning all pass through.
+4. `GET /v1/models` is served locally (upstream has no models endpoint) from the
+   model IDs found in your Cline config, e.g. `cline-pass/kimi-k3`,
+   `cline-pass/glm-5.2`.
+
+> **Technical note:** `api.cline.bot` expects the bearer token with the Cline
+> CLI's `workos:` scheme prefix (`Authorization: Bearer workos:eyJ...`). A raw
+> JWT is rejected with 401. The bridge normalizes this automatically.
+
+## Failure handling
+
+| Situation | Behavior |
+|---|---|
+| Access token expired | Refreshed transparently before the request |
+| Upstream `401` | One forced refresh + retry |
+| Upstream `429/5xx` | Up to 3 retries, backoff 1s → 2s → 4s |
+| Bridge not running | Hermes `fallback_model` (if configured) takes over |
+| Refresh token revoked | JSON error with instructions: run `cline auth cline`, then `.\Start-Bridge.ps1` — the bridge picks up new tokens automatically, no restart needed |
+| Reboot | `.\Start-Bridge.ps1`, or install once with `.\Start-Bridge.ps1 -Install` |
+
+## Configuration
+
+Environment variables (all optional):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BRIDGE_PORT` | `8317` | Listen port |
+| `BRIDGE_HOST` | `127.0.0.1` | Listen host |
+| `CLINE_PROVIDERS_JSON` | `~/.cline/data/settings/providers.json` | Cline token store location |
+| `CLINE_API_BASE` | `https://api.cline.bot/api/v1` | Upstream API |
+| `REFRESH_MARGIN` | `180` | Seconds before expiry to refresh |
+| `BRIDGE_LOG` | `./bridge.log` | Log file path |
+
+## Use with other clients
+
+Anything that speaks OpenAI Chat Completions works:
+
+```bash
+curl http://127.0.0.1:8317/v1/chat/completions \
+  -H "Authorization: Bearer anything" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"cline-pass/kimi-k3","messages":[{"role":"user","content":"hi"}]}'
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8317/v1", api_key="anything")
+print(client.chat.completions.create(
+    model="cline-pass/kimi-k3",
+    messages=[{"role": "user", "content": "hi"}],
+).choices[0].message.content)
+```
+
+## Troubleshooting
+
+- **`No Cline OAuth tokens found`** → run `cline auth cline` first.
+- **`token refresh failed ... 401`** → your session was revoked (password change,
+  sign-out elsewhere). Run `cline auth cline` again; no bridge restart needed.
+- **Port already in use** → another bridge is running (`Start-Bridge.ps1` is a
+  no-op when healthy) or set `BRIDGE_PORT` and update Hermes' `base_url`.
+- **Empty reply with reasoning models** → raise `max_tokens`; reasoning tokens
+  count against it.
+- **Logs** → `bridge.log` next to the script; `--check` and `--refresh-now` are
+  handy CLI probes:
+  `python cline_pass_bridge.py --check`
+
+## Security
+
+- Tokens only travel to `api.workos.com` (refresh) and `api.cline.bot`
+  (inference). The bridge binds to localhost only.
+- Nothing is persisted by the bridge except the token write-back into the Cline
+  CLI's own `providers.json` (a `.bak` is kept per refresh).
+
+## Credits
+
+Inspired by:
+
+- [opencode-google-antigravity-auth](https://github.com/shekohex/opencode-google-antigravity-auth) — the Antigravity OAuth plugin for opencode
+- [opencode-gemini-auth](https://github.com/jenslys/opencode-gemini-auth) — original Gemini OAuth implementation
+- [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) — API translation reference
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
