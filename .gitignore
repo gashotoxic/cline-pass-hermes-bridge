@@ -1,0 +1,8 @@
+# Logs and runtime artifacts (may contain account details)
+*.log
+__pycache__/
+*.pyc
+*.bak
+*.tmp
+# Local test evidence
+hermes-test*.log
