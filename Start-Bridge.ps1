@@ -19,12 +19,16 @@ function Test-Bridge {
 }
 
 if ($Install) {
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-        -Description 'Starts the ClinePass->Hermes OAuth bridge (cline_pass_bridge.py)' -Force | Out-Null
-    Write-Host "Scheduled task '$TaskName' registered (runs at logon)."
+    # schtasks works for a current-user logon task without elevation
+    # (Register-ScheduledTask needs admin on some machines).
+    $cmd = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    schtasks /Create /TN $TaskName /SC ONLOGON /TR $cmd /F | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Scheduled task '$TaskName' registered (runs at logon)."
+    } else {
+        Write-Host 'Task registration failed - re-run from an elevated PowerShell,'
+        Write-Host 'or just run Start-Bridge.ps1 manually when you need the bridge.'
+    }
 }
 
 if (Test-Bridge) {
