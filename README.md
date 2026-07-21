@@ -1,21 +1,26 @@
-# ClinePass OAuth Bridge for Hermes Agent
+# ClinePass OAuth Bridge for Hermes Agent (Multi-Account)
 
-Use your **ClinePass subscription** with [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+Use **one or more ClinePass subscriptions** with [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 — or any OpenAI-compatible client — through the **Cline CLI's OAuth login**.
 No API key is created, copied, or stored anywhere.
 
 A tiny localhost bridge reuses the OAuth session that `cline auth cline` already
-created on your machine, keeps the access token fresh, and exposes a standard
-OpenAI-compatible endpoint at `http://127.0.0.1:8317/v1`.
+created on your machine, keeps access tokens fresh, and exposes a standard
+OpenAI-compatible endpoint at `http://127.0.0.1:8317/v1` — **with built-in
+round-robin across multiple ClinePass accounts.**
 
 ## Features
 
 - **OAuth, not API keys** — reuses your existing Cline CLI sign-in (WorkOS AuthKit)
+- **Multi-account round-robin** — use N ClinePass subscriptions; requests alternate
+  across accounts automatically for 2-5x effective throughput
+- **Per-account failover** — 401/429 on one account? Marked for cooldown, next
+  request goes to the next healthy account transparently
 - **Automatic token refresh** — access tokens live only 1 hour; the bridge refreshes
   them via WorkOS before every request and writes rotated tokens back so the Cline
-  CLI keeps working too
+  CLI stays in sync
 - **Failure resilience** — 401 → force refresh + retry; 429/5xx → backoff retry;
-  clear re-login instructions if the refresh token is ever revoked
+  revoked tokens detected and bypassed for 1h; clear re-login instructions
 - **Watchdog script** — `Start-Bridge.ps1` heals the bridge and can auto-start it
   at logon; Hermes can fail over to a backup model if the bridge is down
 - **Zero dependencies** — Python 3.8+ standard library only. No `pip install`
@@ -33,7 +38,12 @@ OpenAI-compatible endpoint at `http://127.0.0.1:8317/v1`.
 | Windows (Linux/macOS work via env override) | — |
 | Python 3.8+ | `python --version` |
 | Cline CLI with a **ClinePass** subscription | `npm install -g cline` |
-| Signed in once | `cline auth cline` |
+| Signed in once | `cline auth cline` (or VS Code Cline extension) |
+
+> **Note:** If the Cline CLI binary crashes on older CPUs (missing AVX2/BMI2), use
+> the [VS Code Cline extension](https://marketplace.visualstudio.com/items?itemName=saoudrizwan.claude-dev)
+> instead — it runs as JavaScript. Sign in with ClinePass there, then the bridge
+> reads the tokens from the same `providers.json` file.
 
 ## Setup
 
@@ -103,6 +113,68 @@ Hermes config, bridge health, and a live completion):
 
 Each failed check prints its own fix. Re-run until everything is green.
 
+### Multi-Account Setup (N subscriptions)
+
+To use multiple ClinePass accounts for round-robin rotation:
+
+1. Sign in with each account (via VS Code Cline extension or `cline auth cline`):
+   - Each sign-in creates an OAuth session in `~/.cline/data/secrets.json`
+   - No Cline CLI needed — the VS Code extension works identically
+
+2. Add each account to `~/.cline/data/settings/providers.json` with a unique key:
+   - `cline-pass` — first account
+   - `cline-pass-2` — second account
+   - `cline-pass-3` — third account
+   - (any key starting with `cline-pass` is autodetected)
+
+   Each entry must have the same structure:
+   ```json
+   {
+     "settings": {
+       "provider": "cline-pass",
+       "auth": {
+         "accessToken": "workos:eyJ...",
+         "refreshToken": "bq4K...",
+         "expiresAt": 1784610935764,
+         "accountId": "usr-...",
+         "metadata": { "userInfo": { "email": "..." } }
+       },
+       "model": "cline-pass/kimi-k3"
+     },
+     "tokenSource": "oauth"
+   }
+   ```
+
+3. Restart the bridge — it auto-discovers all accounts:
+   ```
+   discovered account: cline-pass (alice@gmail.com)
+   discovered account: cline-pass-2 (bob@gmail.com)
+   ClinePass multi-account bridge listening on http://127.0.0.1:8317/v1
+   ```
+
+4. Verify both accounts are healthy:
+   ```bash
+   curl http://127.0.0.1:8317/health
+   ```
+
+   Returns:
+   ```json
+   {
+     "ok": true,
+     "accounts": [
+       {"key": "cline-pass", "email": "alice@gmail.com", "ok": true},
+       {"key": "cline-pass-2", "email": "bob@gmail.com", "ok": true}
+     ]
+   }
+   ```
+
+5. No changes needed in Hermes config — the bridge handles rotation transparently.
+
+**How it works:** Request 1 → account 1, Request 2 → account 2, Request 3 → account 1...
+If an account 401s or 429s, it's skipped for 60s and the next healthy account handles the request. Revoked tokens are skipped for 1 hour.
+
+**To add more accounts later:** repeat steps 1-3. No bridge restart needed if file-change detection picks it up (or restart for immediate effect).
+
 ### Optional: automatic failover
 
 If the bridge is down or ClinePass rate-limits, Hermes can fall back to another
@@ -117,26 +189,34 @@ fallback_model:
 ## How It Works
 
 ```
-Hermes (custom provider)          cline_pass_bridge.py                api.cline.bot
+Hermes (custom provider)          cline_pass_bridge.py (v2)        api.cline.bot
         │   POST /v1/chat/completions      │                                ▲
-        │ ───────────────────────────────► │  Bearer workos:<access_token>  │
-        │                                  │ ──────────────────────────────►│
-        │   SSE stream / JSON              │                                │
+        │ ───────────────────────────────► │  round-robin across N accounts  │
+        │                                  │ ──── account[0] ──────────────►│
+        │                                  │ ──── account[1] ──────────────►│
+        │   SSE stream / JSON              │ ──── account[N] ──────────────►│
         │ ◄─────────────────────────────── │ ◄──────────────────────────────│
-                                           │   refresh_token grant (hourly)
-        ~/.cline/data/settings/            │ ──────────────────────────────► WorkOS
+                                           │   per-account refresh via WorkOS
+        ~/.cline/data/settings/            │ ─◄─── each account─────────────► WorkOS
         providers.json  ◄── read + write ──┘        /user_management/authenticate
 ```
 
-1. `cline auth cline` performs the browser OAuth flow (WorkOS). Tokens are stored
-   by the Cline CLI — this project never asks you for credentials.
-2. WorkOS access tokens expire after **1 hour**. The bridge checks expiry before
-   every request and refreshes with the `refresh_token` grant when needed.
-   Refresh tokens rotate, so new tokens are written back to `providers.json`
-   (with a timestamped backup) to keep the Cline CLI signed in as well.
-3. Requests are forwarded to `https://api.cline.bot/api/v1/chat/completions`
+1. `cline auth cline` (or VS Code Cline extension) performs the browser OAuth flow (WorkOS).
+   Tokens for the primary account go into `~/.cline/data/settings/providers.json`
+   under key `cline-pass`.
+2. **For multiple accounts**, each additional sign-in creates an OAuth session. Merge
+   the tokens into the same `providers.json` under keys `cline-pass-2`, `cline-pass-3`, etc.
+   The bridge auto-discovers **any** key starting with `cline-pass`.
+3. WorkOS access tokens expire after **1 hour**. Each account's `AccountStore` checks
+   expiry before every request and refreshes independently via WorkOS with its own
+   `refresh_token` grant. Refreshed tokens are written back to `providers.json`
+   (with a timestamped backup).
+4. Requests are round-robinned across all healthy accounts. If one account 401s or
+   429s, it goes into a cooldown period (60s transient, 1h for revoked tokens) and
+   the next account handles the request.
+5. Requests are forwarded to `https://api.cline.bot/api/v1/chat/completions`
    unchanged — streaming, tool calls, and reasoning all pass through.
-4. `GET /v1/models` is served locally (upstream has no models endpoint) from the
+6. `GET /v1/models` is served locally (upstream has no models endpoint) from the
    model IDs found in your Cline config, e.g. `cline-pass/kimi-k3`,
    `cline-pass/glm-5.2`.
 
@@ -148,12 +228,13 @@ Hermes (custom provider)          cline_pass_bridge.py                api.cline.
 
 | Situation | Behavior |
 |---|---|
-| Access token expired | Refreshed transparently before the request |
-| Upstream `401` | One forced refresh + retry |
-| Upstream `429/5xx` | Up to 3 retries, backoff 1s → 2s → 4s |
+| Access token expired | Refreshed transparently per-account before the request |
+| Upstream `401` | One forced refresh + retry; if still failing, skip to next account |
+| Upstream `429/5xx` | Skip to next account immediately; all accounts exhausted → pass-through error |
+| Refresh token revoked | Detected (`invalid_grant`), account cooling down for 1h; other accounts take over |
+| One account always fails | Automatically routes to healthy accounts; dead account bypassed for 1h |
 | Bridge not running | Hermes `fallback_model` (if configured) takes over |
-| Refresh token revoked | JSON error with instructions: run `cline auth cline`, then `.\Start-Bridge.ps1` — the bridge picks up new tokens automatically, no restart needed |
-| Reboot | `.\Start-Bridge.ps1`, or install once with `.\Start-Bridge.ps1 -Install` |
+| Reboot | `.\\Start-Bridge.ps1`, or install once with `.\\Start-Bridge.ps1 -Install` |
 
 ## Configuration
 
@@ -204,6 +285,17 @@ print(client.chat.completions.create(
   ignores ALL config). Restore the newest `config.yaml.bak.*` next to it and
   re-apply your block with a UTF-8-safe editor (VS Code). Never edit it with
   Notepad or PowerShell 5.1 `Set-Content`/`Get-Content` round-trips.
+- **Health endpoint** now returns all accounts:
+  ```json
+  {
+    "ok": true,
+    "all_healthy": true,
+    "accounts": [
+      {"key": "cline-pass", "email": "alice@gmail.com", "ok": true, "cooling_down": false},
+      {"key": "cline-pass-2", "email": "bob@gmail.com", "ok": true, "cooling_down": false}
+    ]
+  }
+  ```
 - **Logs** → `bridge.log` next to the script; `--check` and `--refresh-now` are
   handy CLI probes:
   `python cline_pass_bridge.py --check`
