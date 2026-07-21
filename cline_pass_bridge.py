@@ -54,7 +54,6 @@ REFRESH_MARGIN_SECONDS = int(os.environ.get("REFRESH_MARGIN", "180"))
 REQUEST_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "300"))
 # providers.json entries that share the same WorkOS tokens (prefix match):
 PROVIDER_PREFIX = "cline-pass"
-PROVIDER_KEYS_LEGACY = ("cline-pass", "cline")  # for backward compat
 COOLDOWN_SECONDS = 60  # skip a failed account for this long
 PERM_FAIL_TIMEOUT = 3600  # mark unrecoverable accounts for 1h
 LOG_FILE = os.environ.get("BRIDGE_LOG", os.path.join(BRIDGE_DIR, "bridge.log"))
@@ -284,10 +283,6 @@ class MultiAccountStore:
         if until:
             del self._cooldowns[key]
         return False
-
-    def _mark_cooldown(self, key):
-        self._cooldowns[key] = time.time() + COOLDOWN_SECONDS
-        log("account %s cooling down for %ds" % (key, COOLDOWN_SECONDS))
 
     def next_account(self):
         """Return the next available (key, AccountStore) in round-robin order."""
