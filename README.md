@@ -66,7 +66,9 @@ Verify: `curl http://127.0.0.1:8317/health` → `{"ok": true, ...}`
 
 **3. Add the provider to Hermes** — edit
 `%LOCALAPPDATA%\hermes\config.yaml` (Hermes home: `~/.hermes/config.yaml` on
-Linux/macOS) under `custom_providers`:
+Linux/macOS) under `custom_providers`. A ready-to-paste version (including
+default-model and failover blocks) lives in
+[`hermes-config-example.yaml`](hermes-config-example.yaml):
 
 ```yaml
 custom_providers:
@@ -84,6 +86,22 @@ hermes -z "Refactor this function" --provider custom:cline-pass -m cline-pass/ki
 ```
 
 Or run `hermes model` to make ClinePass your default model.
+
+**5. Verify the whole chain** (checks Python, Cline CLI, OAuth session,
+Hermes config, bridge health, and a live completion):
+
+```powershell
+.\Test-Setup.ps1
+# [PASS] Python 3.8+ installed
+# [PASS] Cline CLI installed
+# [PASS] Cline OAuth session (cline auth cline)
+# [PASS] Hermes config.yaml valid + cline-pass provider
+# [PASS] Bridge healthy on 127.0.0.1:8317
+# [PASS] Live ClinePass completion via bridge
+# ALL CHECKS PASSED - harness is ready.
+```
+
+Each failed check prints its own fix. Re-run until everything is green.
 
 ### Optional: automatic failover
 
@@ -179,6 +197,13 @@ print(client.chat.completions.create(
   no-op when healthy) or set `BRIDGE_PORT` and update Hermes' `base_url`.
 - **Empty reply with reasoning models** → raise `max_tokens`; reasoning tokens
   count against it.
+- **Hermes says `Unknown provider 'custom:cline-pass'` and/or warns that
+  config.yaml can't be parsed** → the file's encoding got corrupted (a classic
+  when it is edited with tools that rewrite it as Windows-1252: multibyte emoji
+  in the personalities section turn into control characters and Hermes silently
+  ignores ALL config). Restore the newest `config.yaml.bak.*` next to it and
+  re-apply your block with a UTF-8-safe editor (VS Code). Never edit it with
+  Notepad or PowerShell 5.1 `Set-Content`/`Get-Content` round-trips.
 - **Logs** → `bridge.log` next to the script; `--check` and `--refresh-now` are
   handy CLI probes:
   `python cline_pass_bridge.py --check`

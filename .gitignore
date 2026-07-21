@@ -7,3 +7,4 @@ __pycache__/
 # Local test evidence
 hermes-test*.log
 SETUP-REPORT.md
+fix_config.py

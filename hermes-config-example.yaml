@@ -1,0 +1,37 @@
+# ==========================================================================
+# Hermes Agent config snippets for the ClinePass OAuth bridge.
+#
+# Paste into:  %LOCALAPPDATA%\hermes\config.yaml      (Windows)
+#              ~/.hermes/config.yaml                  (Linux/macOS)
+#
+# IMPORTANT: config.yaml is UTF-8. Edit it with a real editor (VS Code, not
+# Notepad) and keep it UTF-8 without BOM. Corrupting the encoding makes
+# Hermes ignore ALL of your config silently.
+# ==========================================================================
+
+# --- 1. Make ClinePass the default model -----------------------------------
+model:
+  default: cline-pass/kimi-k3
+  provider: cline-pass
+  base_url: http://127.0.0.1:8317/v1
+
+# --- 2. Register the bridge as a custom provider ---------------------------
+# (append to your existing custom_providers list; keep any entries you have)
+custom_providers:
+  - name: cline-pass
+    base_url: http://127.0.0.1:8317/v1
+    api_key: bridge-managed-oauth   # dummy - the bridge injects the OAuth token
+    model: cline-pass/kimi-k3
+    api_mode: chat_completions
+
+# --- 3. Automatic failover when the bridge is down -------------------------
+# Pick any provider with a WORKING key and put that key in .env.
+# This example uses chutes (free tier: https://llm.chutes.ai):
+fallback_model:
+  provider: chutes
+  model: zai-org/GLM-5.2-TEE
+  base_url: https://llm.chutes.ai/v1
+  key_env: CHUTES_API_KEY
+
+# Then add to %LOCALAPPDATA%\hermes\.env (or ~/.hermes/.env):
+#   CHUTES_API_KEY=cpk_your_key_here
