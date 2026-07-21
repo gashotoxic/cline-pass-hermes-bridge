@@ -481,8 +481,7 @@ class Handler(BaseHTTPRequestHandler):
             # Try upstream
             try:
                 resp = _open_upstream("/chat/completions", raw, token)
-                if attempt > 0:
-                    log("request succeeded on account %s (attempt %d)" % (acct_key, attempt + 1))
+                log("served by %s (attempt %d)" % (acct_key, attempt + 1))
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read()
