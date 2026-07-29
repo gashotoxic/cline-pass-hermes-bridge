@@ -292,14 +292,44 @@ class SecretsAccountStore:
                 log("reload failed for secrets.json (%s); keeping in-memory copy" % exc)
 
     def _auth_data(self):
-        """Parse the secrets.json entry and return a normalized auth dict."""
+        """Parse the secrets.json entry and return a normalized auth dict.
+
+        Falls back to .bak files if the primary secrets.json was wiped
+        (e.g. by a VS Code update that revokes the Cline session).
+        """
         val = self._raw.get(self.SECRETS_KEY)
-        if not val:
-            raise RuntimeError("No '%s' key in secrets.json - re-auth via Cline extension" % self.SECRETS_KEY)
-        data = json.loads(val)  # value is a JSON string
-        if not data.get("refreshToken"):
-            raise RuntimeError("No refreshToken in secrets.json - re-auth via Cline extension")
-        return data
+        if val:
+            data = json.loads(val)  # value is a JSON string
+            if data.get("refreshToken"):
+                return data
+        # Primary missing/invalid — try .bak files
+        data = self._try_restore_from_backup()
+        if data and data.get("refreshToken"):
+            return data
+        raise RuntimeError(
+            "No '%s' key in secrets.json - re-auth via Cline extension" % self.SECRETS_KEY
+        )
+
+    def _try_restore_from_backup(self):
+        """Attempt to load auth data from .bak files when primary is empty/invalid."""
+        import glob
+        for bak in sorted(glob.glob(self.path + ".bak.*"), reverse=True):
+            try:
+                with open(bak, "r", encoding="utf-8") as fh:
+                    raw = json.load(fh)
+                val = raw.get(self.SECRETS_KEY)
+                if val:
+                    data = json.loads(val)
+                    if data.get("refreshToken"):
+                        # Restore this backup as the primary
+                        self._raw = raw
+                        self._write_atomic()
+                        self._mtime = os.path.getmtime(self.path)
+                        log("secrets.json restored from backup: %s" % bak)
+                        return data
+            except Exception:
+                continue
+        return None
 
     def email(self):
         try:
@@ -393,6 +423,36 @@ class SecretsAccountStore:
         self._raw[self.SECRETS_KEY] = json.dumps(auth)
         self._write_atomic()
         log("Token refreshed OK for %s (expires_in=%ss)" % (self.key, expires_in))
+        # Persist fresh token back to providers.json as durable fallback
+        self._persist_to_providers(auth, new_access, new_refresh)
+
+    def _persist_to_providers(self, auth, access_token, refresh_token):
+        """Write the refreshed token back to providers.json so the legacy
+        AccountStore path can survive a secrets.json wipe."""
+        try:
+            prov_path = CLINE_PROVIDERS_JSON
+            if not os.path.exists(prov_path):
+                return
+            with open(prov_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            email = auth.get("userInfo", {}).get("email", "")
+            provs = data.get("providers", {})
+            for key, prov in provs.items():
+                if not key.startswith("cline-pass"):
+                    continue
+                p_email = prov.get("settings", {}).get("auth", {}).get(
+                    "metadata", {}).get("userInfo", {}).get("email", "")
+                if p_email == email:
+                    prov["settings"]["auth"]["accessToken"] = "workos:" + access_token
+                    prov["settings"]["auth"]["refreshToken"] = refresh_token
+                    prov["settings"]["auth"]["expiresAt"] = auth["expiresAt"] * 1000
+                    prov["settings"]["auth"]["metadata"]["userInfo"] = auth["userInfo"]
+                    log("providers.json updated for %s (%s)" % (key, email))
+                    break
+            with open(prov_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except Exception as exc:
+            log("providers.json persist failed: %s" % exc)
 
     def _write_atomic(self):
         backup = "%s.bak.%s" % (self.path, datetime.now().strftime("%Y%m%d_%H%M%S"))
