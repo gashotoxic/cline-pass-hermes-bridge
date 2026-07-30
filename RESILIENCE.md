@@ -30,6 +30,33 @@ token back to `providers.json` under the matching `cline-pass` account entry.
 This means even if `secrets.json` is wiped, the legacy `AccountStore` path
 can pick up the token from `providers.json`.
 
+## Model name mapping (cline-free vs cline-pass)
+
+Some models are server-locked to Cline product surfaces and return 403 when
+called through the bridge. The bridge now remaps these automatically:
+
+| Bridge model name | Upstream model name | Status |
+|-------------------|---------------------|--------|
+| `cline-free/glm-5.2` | `cline-pass/glm-5.2` | Remapped |
+| `cline-pass/kimi-k3` | `cline-pass/kimi-k3` | Direct |
+| `poolside/laguna-s-2.1:free` | `poolside/laguna-s-2.1:free` | Direct |
+| `minimax/minimax-m3` | `minimax/minimax-m3` | Direct |
+| `xiaomi/mimo-v2.5-pro` | `xiaomi/mimo-v2.5-pro` | Direct |
+| `stepfun/step-3.7-flash` | `stepfun/step-3.7-flash` | Direct |
+
+## Token efficiency for large codebases
+
+| Model | Context | Max Output | Reasoning Tax | Best For |
+|-------|---------|------------|---------------|----------|
+| `poolside/laguna-s-2.1:free` | 262k | 32k | 0% | Large files, delegation |
+| `minimax/minimax-m3` | ? | ? | 0% | Large files, delegation |
+| `cline-pass/glm-5.2` | 1M | 128k | ~77% | Complex reasoning (wasteful) |
+| `cline-pass/kimi-k3` | ? | ? | ~81% | Complex reasoning (wasteful) |
+
+**Recommendation:** Use `poolside/laguna-s-2.1:free` or `minimax/minimax-m3`
+for delegation/subagents and large codebase work. They give 100% content output
+with no reasoning token overhead.
+
 ## If the bridge still fails after account switch
 
 1. Check `~/.cline/data/secrets.json` — should contain the new account
@@ -51,3 +78,4 @@ can pick up the token from `providers.json`.
 
 The bridge starts via VBS in Windows Startup folder. Do NOT manually restart
 unless the process is actually dead — the bridge auto-reloads tokens from disk.
+After `taskkill`, the VBS auto-restarts the bridge with a new PID.
