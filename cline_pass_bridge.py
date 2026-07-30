@@ -77,6 +77,13 @@ MAX_RETRIES = 3
 RETRY_BACKOFF = (1, 2, 4)  # seconds
 
 # Models offered by the Cline free tier + legacy paid models
+# Model name mapping: bridge name -> upstream Cline API name
+# Some models are only available via Cline product surfaces and need
+# the upstream name to work through the bridge.
+MODEL_NAME_MAP = {
+    "cline-free/glm-5.2": "cline-pass/glm-5.2",
+}
+
 FREE_MODELS = [
     "cline-free/glm-5.2",
     "stepfun/step-3.7-flash",
@@ -682,6 +689,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length)
+        # Remap model name if needed (e.g. cline-free/* -> cline-pass/*)
+        try:
+            req_body = json.loads(raw)
+            model = req_body.get("model", "")
+            mapped = MODEL_NAME_MAP.get(model, model)
+            if mapped != model:
+                req_body["model"] = mapped
+                raw = json.dumps(req_body).encode()
+                log("model remapped: %s -> %s" % (model, mapped))
+        except Exception:
+            pass
         try:
             want_stream = bool(json.loads(raw).get("stream", True))
         except Exception:
