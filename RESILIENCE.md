@@ -110,6 +110,46 @@ format mismatches.
 
 ---
 
+## 2026-08-19 — Browser-based auth (RFC 8628 Device Grant) — NO VS Code needed
+
+**Problem:** VS Code Cline login ends the current session and wipes secrets.json. Adding a second account requires logging out of the first. Two accounts can't coexist in the VS Code extension.
+
+**Discovery:** Cline's WorkOS backend supports OAuth 2.0 Device Authorization Grant (RFC 8628) — the same flow as `gh auth login` or Azure CLI. The extension itself uses this internally (`Oko={deviceAuthorization:"/user_management/authorize/device"}`).
+
+**How it works:**
+1. `python cline_device_auth.py` — script requests a device code from WorkOS
+2. Browser opens `https://authkit.cline.bot/device?user_code=XXXX-XXXX`
+3. User logs in as ANY Cline account (gashotechnologies, nibsstudents101, etc.)
+4. Script polls WorkOS, receives tokens, writes to `~/.cline/data/secrets.json`
+5. Bridge detects the change via mtime watch — no restart needed
+
+**Token format is IDENTICAL to VS Code auth.** The bridge cannot tell the difference. Same `secrets.json` shape, same refresh flow, same `providers.json` persistence.
+
+**Key difference from VS Code auth:**
+- VS Code: `secrets.json` holds ONE account (the last one logged in). Switching accounts overwrites it.
+- Device auth: `secrets.json` still holds one account, BUT the bridge also persists to `providers.json`, so both accounts stay usable for round-robin.
+
+**To add a new account without killing the current one:**
+```bash
+cd ~/cline-pass-hermes-bridge
+python cline_device_auth.py
+# Log in as the new account in the browser that opens
+# Bridge auto-detects; both accounts now active
+```
+
+**Files:**
+- `cline_device_auth.py` — standalone device auth script (pure stdlib, no deps)
+- `~/.cline/data/secrets.json` — active auth (same format as VS Code writes)
+
+**VS Code extension internal details discovered:**
+- WorkOS client_id: `client_01K3A541FN8TA3EPPHTD2325AR` (extracted from idToken JWT)
+- Device auth endpoint: `POST https://api.workos.com/user_management/authorize/device`
+- Token endpoint: `POST https://api.workos.com/user_management/authenticate`
+- Redirect URI for localhost callback (VS Code): `http://localhost:1455/auth/callback` (registered but NOT usable for device auth)
+- Device auth verification URI: `https://authkit.cline.bot/device`
+
+---
+
 ## 2026-08-05 — Decoupled bridge from Hermes venv (no new venv needed)
 
 **Problem:** Every `hermes update` on Windows stalled at the `hermes.exe` replacement
