@@ -79,3 +79,52 @@ with no reasoning token overhead.
 The bridge starts via VBS in Windows Startup folder. Do NOT manually restart
 unless the process is actually dead — the bridge auto-reloads tokens from disk.
 After `taskkill`, the VBS auto-restarts the bridge with a new PID.
+
+## Fixed 2026-08-04: delegation children failing "Invalid API response: response.choices is None"
+
+**Symptom:** `delegate_task` children always failed with "Invalid API response after 3
+retries: response time ~45s" — but the parent (interactive) worked fine.
+
+**Root cause:** the bridge defaulted `want_stream = True` when a request omitted the
+`stream` field (line ~705). Delegated children (Hermes's `direct_api_call` non-streaming
+path) omit `stream`. The bridge then treated the request as SSE, yet the upstream Cline
+gateway (which also saw no stream flag) returned plain JSON. The bridge relayed JSON
+bytes through the SSE path → the child's consumer couldn't parse it →
+`response.choices is None`.
+
+**Fix (two changes in `cline_pass_bridge.py`):**
+1. `want_stream = bool(json.loads(raw).get("stream", False))` — OpenAI spec default is
+   FALSE. Mirrors client intent; upstream JSON stays JSON.
+2. Unwrap the upstream non-streaming envelope: the Cline gateway wraps non-streaming
+   responses in `{"data": {chat.completion}, "success": true}`. Standard OpenAI clients
+   (Hermes, raw SDK) expect top-level `choices`. The non-streaming relay branch now
+   extracts `payload["data"]` when `choices` is missing at top level.
+
+**Diagnostics added:** the relay logs `relay: req_stream=... want_stream=... ctype=...
+is_sse=...` and `relay stream=... sse=... ctype=... unwrapped=... bodylen=...` per
+chat-completion request — check `bridge.log` for these when debugging client/upstream
+format mismatches.
+
+**Files:** `cline_pass_bridge.py` (patched), `cline_pass_bridge.py.bak-20260804` (pre-fix backup).
+**Restart:** kill the pythonw process listening on 8317, then `start-bridge.vbs`.
+
+---
+
+## 2026-08-05 — Decoupled bridge from Hermes venv (no new venv needed)
+
+**Problem:** Every `hermes update` on Windows stalled at the `hermes.exe` replacement
+because the bridge (`pythonw.exe` booted from Hermes' own venv) locked the venv files.
+Windows won't rename/delete an in-use interpreter, so the updater deferred to reboot.
+
+**Fix:** `start-bridge.vbs` now points at uv's standalone Python
+(`C:\Users\Gasho\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\pythonw.exe`)
+instead of the Hermes venv. The bridge uses **only stdlib** (json, os, shutil, sys,
+threading, time, urllib, base64, datetime, http.server) — no third-party packages, so
+no new venv was created; zero bloat, zero duplicated deps.
+
+**Backup:** `start-bridge.vbs.bak-20260805` (pre-change launcher).
+
+**Effect:** The bridge no longer locks Hermes' venv, so `hermes update` can swap the
+launcher inline without stopping the bridge or rebooting. **Take effect:** next time
+the bridge is restarted via `start-bridge.vbs`. Any bridge process still running from
+the old venv path should be replaced at the next natural restart.

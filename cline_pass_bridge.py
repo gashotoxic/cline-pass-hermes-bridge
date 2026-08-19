@@ -94,6 +94,7 @@ FREE_MODELS = [
 LEGACY_MODELS = [
     "cline-pass/kimi-k3",
     "cline-pass/glm-5.2",
+    "cline-pass/deepseek-v4-flash",
 ]
 
 
@@ -701,9 +702,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         try:
-            want_stream = bool(json.loads(raw).get("stream", True))
+            want_stream = bool(json.loads(raw).get("stream", False))
         except Exception:
-            want_stream = True
+            want_stream = False
 
         resp = None
         tried_accounts = set()
@@ -801,6 +802,8 @@ class Handler(BaseHTTPRequestHandler):
         # ---- relay response (streaming-aware) ----
         ctype = resp.headers.get("Content-Type", "application/json")
         is_sse = want_stream or "text/event-stream" in ctype
+        log("relay: req_stream=%r want_stream=%s ctype=%s is_sse=%s" % (
+            json.loads(raw).get("stream") if raw else None, want_stream, ctype, is_sse))
         self.send_response(resp.status)
         self.send_header("Content-Type", ctype)
         if is_sse:
@@ -818,6 +821,28 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         else:
             body = resp.read()
+            # Cline's upstream wraps non-streaming /chat/completions
+            # responses in {"data": {openai-object}, "success": true}.
+            # Standard OpenAI clients (Hermes delegation, cron, raw SDK)
+            # expect the bare chat.completion object with top-level
+            # "choices". Unwrap so those non-streaming clients work.
+            unwrapped = False
+            if not is_sse:
+                try:
+                    payload = json.loads(body)
+                    if (
+                        isinstance(payload, dict)
+                        and "data" in payload
+                        and "choices" not in payload
+                    ):
+                        inner = payload["data"]
+                        if isinstance(inner, dict) and "choices" in inner:
+                            body = json.dumps(inner).encode("utf-8")
+                            unwrapped = True
+                except Exception:
+                    pass
+            log("relay stream=%s sse=%s ctype=%s unwrapped=%s bodylen=%d" % (
+                want_stream, is_sse, ctype, unwrapped, len(body)))
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
