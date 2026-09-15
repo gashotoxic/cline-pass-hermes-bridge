@@ -13,8 +13,12 @@ v3 changes:
       ~/.cline/data/secrets.json  (key: "cline:clineAccountId")
       ~/.cline/data/globalState.json  (model selection)
   - Backwards-compatible with old ~/.cline/data/settings/providers.json
-  - New free-tier model names: cline-free/glm-5.2, stepfun/step-3.7-flash,
-    poolside/laguna-s-2.1:free
+  - Free-tier model names: cline:z-ai/glm-5.3-flash,
+    cline:deepseek/deepseek-v4-flash, cline-free/glm-5.2,
+    stepfun/step-3.7-flash, poolside/laguna-s-2.1:free,
+    minimax/minimax-m3, xiaomi/mimo-v2.5-pro
+  - Subscription models: cline-pass/ (kimi, glm, deepseek, mimo,
+    minimax, qwen series)
 
 How it works:
   1. You sign in with the Cline VS Code extension (browser OAuth via WorkOS).
@@ -44,6 +48,7 @@ import time
 import urllib.error
 import urllib.request
 from base64 import urlsafe_b64decode
+import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -82,9 +87,18 @@ RETRY_BACKOFF = (1, 2, 4)  # seconds
 # the upstream name to work through the bridge.
 MODEL_NAME_MAP = {
     "cline-free/glm-5.2": "cline-pass/glm-5.2",
+    "cline:z-ai/glm-5.3-flash": "cline-pass/glm-5.3-flash",
+    "cline:deepseek/deepseek-v4-flash": "cline-pass/deepseek-v4-flash",
 }
 
 FREE_MODELS = [
+    # cline: prefix = free / credits-based models (provider/model format)
+    "cline:z-ai/glm-5.3-flash",
+    "cline:deepseek/deepseek-v4-flash",
+    # free tier (per ClinePass Bridge Guide v2.0) — needs product-surface headers
+    "cline-free/solar-pro4",
+    "cline-free/muse-spark-1.3-contributor",
+    "cline-free/longcat-2.0",
     "cline-free/glm-5.2",
     "stepfun/step-3.7-flash",
     "poolside/laguna-s-2.1:free",
@@ -92,9 +106,22 @@ FREE_MODELS = [
     "xiaomi/mimo-v2.5-pro",
 ]
 LEGACY_MODELS = [
+    # cline-pass/ prefix = subscription models
+    "cline-pass/deepseek-v4.1-flash",
     "cline-pass/kimi-k3",
+    "cline-pass/kimi-k2.6",
+    "cline-pass/kimi-k2.7-code",
     "cline-pass/glm-5.2",
+    "cline-pass/glm-5.3",
+    "cline-pass/glm-5.3-flash",
     "cline-pass/deepseek-v4-flash",
+    "cline-pass/deepseek-v4-pro",
+    "cline-pass/mimo-v2.5",
+    "cline-pass/mimo-v2.5-pro",
+    "cline-pass/minimax-m3",
+    "cline-pass/qwen3.7-max",
+    "cline-pass/qwen3.7-plus",
+    "cline-pass/qwen3.8-max",
 ]
 
 
@@ -638,9 +665,18 @@ def _open_upstream(path, raw_body, token):
             "Authorization": "Bearer " + token,
             "Content-Type": "application/json",
             "Accept": "*/*",
-            "User-Agent": "cline-pass-hermes-bridge/3.0",
-            "X-Title": "hermes-agent (via cline-pass bridge)",
-            "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
+            # Product-surface headers (per ClinePass Bridge Guide v2.0):
+            # required for cline-free/* routes, harmless elsewhere.
+            "User-Agent": "Cline/3.0.39",
+            "X-Title": "Cline",
+            "HTTP-Referer": "https://cline.bot",
+            "X-CLIENT-TYPE": "cline-sdk",
+            "X-CLIENT-VERSION": "3.0.39",
+            "X-PLATFORM": "cli",
+            "X-PLATFORM-VERSION": "3.0.39",
+            "X-CORE-VERSION": "3.0.39",
+            "X-IS-MULTIROOT": "false",
+            "X-Task-ID": "bridge-%s" % uuid.uuid4(),
         },
         method="POST",
     )
@@ -707,6 +743,8 @@ class Handler(BaseHTTPRequestHandler):
             want_stream = False
 
         resp = None
+        preloaded_body = None
+        last_wrapped = None
         tried_accounts = set()
         account_count = len(STORE._accounts)
 
@@ -743,6 +781,41 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
                 resp = _open_upstream("/chat/completions", raw, token)
+                preloaded_body = None
+                if not want_stream:
+                    # Cline's gateway sometimes returns per-account errors
+                    # (ENTITLEMENT_ERROR, insufficient credits) wrapped in
+                    # HTTP 200. Peek non-streaming bodies and fail over to
+                    # the next account instead of leaking the error.
+                    peek = resp.read()
+                    try:
+                        parsed = json.loads(peek)
+                        is_wrapped_error = (
+                            isinstance(parsed, dict)
+                            and "error" in parsed
+                            and "choices" not in parsed
+                            and not (isinstance(parsed.get("data"), dict)
+                                     and "choices" in parsed["data"])
+                        )
+                    except Exception:
+                        is_wrapped_error = False
+                        parsed = None
+                    if is_wrapped_error:
+                        err = parsed.get("error")
+                        code = err.get("code", "") if isinstance(err, dict) else str(err)[:60]
+                        log("upstream 200-wrapped error for %s (%s)" % (acct_key, code))
+                        last_wrapped = (parsed, peek)
+                        STORE.mark_failure(acct_key)
+                        tried_accounts.add(acct_key)
+                        if len(tried_accounts) >= account_count:
+                            self.send_response(403)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Content-Length", str(len(peek)))
+                            self.end_headers()
+                            self.wfile.write(peek)
+                            return
+                        continue
+                    preloaded_body = peek
                 log("served by %s (attempt %d)" % (acct_key, attempt + 1))
                 break
             except urllib.error.HTTPError as exc:
@@ -768,7 +841,10 @@ class Handler(BaseHTTPRequestHandler):
                             })
                             return
                         continue
-                if exc.code in (429, 500, 502, 503, 529):
+                if exc.code in (402, 403, 429, 500, 502, 503, 529):
+                    # 402 = insufficient credits, 403 = entitlement/plan error:
+                    # these are PER-ACCOUNT conditions (mixed ClinePass fleet),
+                    # so fail over to the next account instead of leaking to client.
                     log("upstream %s for %s" % (exc.code, acct_key))
                     STORE.mark_failure(acct_key)
                     tried_accounts.add(acct_key)
@@ -796,6 +872,14 @@ class Handler(BaseHTTPRequestHandler):
                 continue
 
         if resp is None:
+            if last_wrapped is not None:
+                parsed, peek = last_wrapped
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(peek)))
+                self.end_headers()
+                self.wfile.write(peek)
+                return
             self._send_json(502, {"error": {"message": "no account succeeded", "type": "upstream_error"}})
             return
 
@@ -820,7 +904,7 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
         else:
-            body = resp.read()
+            body = preloaded_body if preloaded_body is not None else resp.read()
             # Cline's upstream wraps non-streaming /chat/completions
             # responses in {"data": {openai-object}, "success": true}.
             # Standard OpenAI clients (Hermes delegation, cron, raw SDK)
@@ -848,6 +932,32 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
 
+def _proactive_refresh_loop():
+    """Background thread: refresh each account's token 5 min before expiry.
+    Prevents the bridge from ever hitting a dead-token state."""
+    while True:
+        time.sleep(60)  # check every minute
+        try:
+            for key in sorted(STORE._accounts.keys()):
+                store = STORE._accounts[key]
+                # Skip cooling-down accounts
+                if STORE._is_cooling_down(key):
+                    continue
+                try:
+                    st = store.status()
+                    remaining = st.get("expires_in_seconds", 0)
+                    # Refresh if less than 5 min left (and not already refreshing)
+                    if remaining < 300:
+                        log("proactive refresh: %s (%ss left)" % (key, remaining))
+                        store.access_token(force_refresh=True)
+                        log("proactive refresh OK: %s (new expiry %ss)" % (
+                            key, store.status().get("expires_in_seconds", 0)))
+                except Exception as exc:
+                    log("proactive refresh failed for %s: %s" % (key, exc))
+        except Exception as exc:
+            log("proactive refresh loop error: %s" % exc)
+
+
 def main():
     global STORE
     STORE = MultiAccountStore(CLINE_SECRETS_JSON, CLINE_PROVIDERS_JSON)
@@ -864,6 +974,12 @@ def main():
             print("refresh OK: %s (%s) (new token expires in %ds)" % (
                 key, st["email"], st["expires_in_seconds"]))
         return
+    if "--no-proactive" in sys.argv:
+        log("proactive refresh disabled via --no-proactive")
+    else:
+        refresh_thread = threading.Thread(target=_proactive_refresh_loop, daemon=True)
+        refresh_thread.start()
+        log("proactive refresh thread started (checks every 60s, refreshes <5min before expiry)")
 
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     log("ClinePass v3 multi-account bridge listening on http://%s:%d/v1 -> %s" % (
