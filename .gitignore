@@ -8,3 +8,7 @@ __pycache__/
 hermes-test*.log
 SETUP-REPORT.md
 fix_config.py
+# Credential stores — NEVER commit (2026-09-18)
+secrets.json
+providers*.json
+globalState.json

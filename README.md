@@ -307,6 +307,20 @@ print(client.chat.completions.create(
 - Nothing is persisted by the bridge except the token write-back into the Cline
   CLI's own `providers.json` (a `.bak` is kept per refresh).
 
+
+## Kali Linux Variant (v2 script)
+
+The Kali machine runs a variant, `cline_pass_bridge_v2.py`, in this same repo:
+
+- Multi-account OAuth round-robin (WorkOS tokens auto-refreshed, one-time-use — never test refresh tokens manually)
+- Product-surface headers (`X-CLIENT-TYPE: cline-sdk`, `User-Agent: Cline/3.0.39`, ...) so `cline-free/*` models pass Cline's product-surface gate
+- `curated` catalog tuple (26 models as of 2026-09-18, matching the Windows fleet — see the "ClinePass Bridge - Complete Setup & Configuration Guide" on Google Drive)
+- Runs as a systemd user service: `systemctl --user restart clinepass-bridge` (needs `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`)
+- Device-flow account auth without the Cline CLI: `node cline-auth.js` (5-minute window)
+- See `LINUX-SETUP.md` and `MAINTENANCE-GUIDE.md` for the full Kali runbook
+
+Note: Windows uses `cline_pass_bridge.py` (v3) + the PowerShell/VBS installers; Kali uses `cline_pass_bridge_v2.py` + systemd. Do not cross-apply line numbers or tuple names between them.
+
 ## Credits
 
 Inspired by:
