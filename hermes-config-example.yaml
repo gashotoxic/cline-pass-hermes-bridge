@@ -9,6 +9,29 @@
 # Hermes ignore ALL of your config silently.
 # ==========================================================================
 
+# --- 4. Available models -----------------------------------------------
+# Run `hermes model` or `/models` to see the full catalog.
+# The bridge serves these models from your Cline config + fallback list:
+#
+#   Subscription (cline-pass/):
+#     cline-pass/kimi-k3, kimi-k2.6, kimi-k2.7-code
+#     cline-pass/glm-5.2, glm-5.3, glm-5.3-flash
+#     cline-pass/deepseek-v4-flash, deepseek-v4-pro
+#     cline-pass/mimo-v2.5, mimo-v2.5-pro
+#     cline-pass/minimax-m3
+#     cline-pass/qwen3.7-max, qwen3.7-plus, qwen3.8-max
+#
+#   Free / credits (cline: prefix — auto-remapped upstream):
+#     cline:z-ai/glm-5.3-flash, cline:deepseek/deepseek-v4-flash
+#
+#   Legacy free-tier:
+#     cline-free/glm-5.2, stepfun/step-3.7-flash,
+#     poolside/laguna-s-2.1:free, minimax/minimax-m3,
+#     xiaomi/mimo-v2.5-pro
+#
+# To set a default model:
+#   hermes model --provider cline-pass --model cline-pass/glm-5.3
+#
 # --- 1. Make ClinePass the default model -----------------------------------
 model:
   default: cline-pass/kimi-k3

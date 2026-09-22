@@ -88,7 +88,18 @@ RETRY_BACKOFF = (1, 2, 4)  # seconds
 MODEL_NAME_MAP = {
     "cline-free/glm-5.2": "cline-pass/glm-5.2",
     "cline:z-ai/glm-5.3-flash": "cline-pass/glm-5.3-flash",
-    "cline:deepseek/deepseek-v4-flash": "cline-pass/deepseek-v4-flash",
+    # deepseek-v4-flash was removed upstream (404 on every form, confirmed
+    # 2026-09-22); the alias now serves its successor v4.1-flash.
+    "cline:deepseek/deepseek-v4-flash": "cline-pass/deepseek-v4.1-flash",
+    "cline-pass/deepseek-v4-flash": "cline-pass/deepseek-v4.1-flash",
+    # mimo-v2.6-pro: bare and xiaomi/ forms reach the credits route upstream
+    # (402, $0 balance) or get rejected on format (bare); serve the
+    # subscription form instead.
+    "mimo-v2.6-pro": "cline-pass/mimo-v2.6-pro",
+    "xiaomi/mimo-v2.6-pro": "cline-pass/mimo-v2.6-pro",
+    # xiaomi/mimo-v2.5-pro moved from free tier to credits upstream (402,
+    # 2026-09-22); serve the subscription form instead.
+    "xiaomi/mimo-v2.5-pro": "cline-pass/mimo-v2.5-pro",
 }
 
 FREE_MODELS = [
@@ -104,6 +115,9 @@ FREE_MODELS = [
     "poolside/laguna-s-2.1:free",
     "minimax/minimax-m3",
     "xiaomi/mimo-v2.5-pro",
+    # free-tier ids used by the Hermes config (verified 2026-09-22)
+    "cline-free/kimi-k3",
+    "cline-free/deepseek-v4.1-flash",
 ]
 LEGACY_MODELS = [
     # cline-pass/ prefix = subscription models
@@ -118,6 +132,7 @@ LEGACY_MODELS = [
     "cline-pass/deepseek-v4-pro",
     "cline-pass/mimo-v2.5",
     "cline-pass/mimo-v2.5-pro",
+    "cline-pass/mimo-v2.6-pro",
     "cline-pass/minimax-m3",
     "cline-pass/qwen3.7-max",
     "cline-pass/qwen3.7-plus",
@@ -127,7 +142,14 @@ LEGACY_MODELS = [
 
 def log(msg):
     line = "[%s] %s" % (datetime.now().isoformat(timespec="seconds"), msg)
-    print(line, flush=True)
+    # stdout may be a dead pipe when launched from a shell that has exited
+    # (broken pipe on print). A broken stdout must never break logging or the
+    # HTTP handler / token-refresh code that calls log() — guard the print and
+    # always write the file.
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")

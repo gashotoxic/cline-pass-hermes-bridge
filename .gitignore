@@ -12,3 +12,5 @@ fix_config.py
 secrets.json
 providers*.json
 globalState.json
+
+nibs_tokens.json
