@@ -168,3 +168,28 @@ no new venv was created; zero bloat, zero duplicated deps.
 launcher inline without stopping the bridge or rebooting. **Take effect:** next time
 the bridge is restarted via `start-bridge.vbs`. Any bridge process still running from
 the old venv path should be replaced at the next natural restart.
+
+---
+
+## 2026-09-22 — Broken-stdout launch trap (silent bridge death) + model-map refresh
+
+**Problem:** starting the bridge from an agent shell (`pythonw ... &`) inherits the shell's
+stdout pipe. When the shell exits, `log()`'s `print()` raises BrokenPipeError BEFORE the
+file write — and since `log_message`/`send_response` call `log()`, every HTTP reply becomes
+an empty close. The proactive-refresh thread dies the same way at its first `log()`, so all
+tokens expire unrefreshed, silently (the log file gets nothing). Symptom: empty curl replies
+(52 / 000) minutes after a "successful" start while `/health` may still answer 200.
+
+**Fix:** `log()` now guards `print()`; the file write always runs. Start DETACHED via Task
+Scheduler: `schtasks /Run /TN ClinePassBridge` (one-time task created 2026-09-22, `/SC ONCE`
+= run on demand; logon auto-start remains start-bridge.vbs). Stop: `taskkill /PID <pid> /F`.
+Mass-expired tokens: `python cline_pass_bridge.py --refresh-now` (native `C:/...` path).
+
+**Model map changes (2026-09-22):** `deepseek-v4-flash` removed upstream (404 on every
+form) — `cline:deepseek/deepseek-v4-flash` and `cline-pass/deepseek-v4-flash` now serve
+`cline-pass/deepseek-v4.1-flash`. `xiaomi/mimo-v2.5-pro` moved from free tier to credits
+(402) — mapped to `cline-pass/mimo-v2.5-pro`. Bare `mimo-v2.6-pro` and
+`xiaomi/mimo-v2.6-pro` mapped to `cline-pass/mimo-v2.6-pro` (bare names get 400 invalid
+format; xiaomi/ forms are credits-only at $0 balance). `mimo-v2.6` (non-pro) has no
+bridge-able form. Advertised lists gained `cline-free/kimi-k3`,
+`cline-free/deepseek-v4.1-flash`, `cline-pass/mimo-v2.6-pro`.
