@@ -53,16 +53,22 @@ def check_providers():
     for key in sorted(providers.keys()):
         if not key.startswith('cline-pass'):
             continue
-        
+
         p = providers[key]
         auth = p.get('settings', {}).get('auth', {})
+        # Config-only legacy entry (e.g. the bare 'cline-pass' key) has no auth
+        # section at all — the bridge no longer serves it, so skip it instead
+        # of reporting a spurious "cannot decode access token" issue.
+        if not auth:
+            log(f"{key}: no auth section (config-only entry) — skipped")
+            continue
         email = auth.get('metadata', {}).get('userInfo', {}).get('email', 'unknown')
         at = auth.get('accessToken', '')
         rt = auth.get('refreshToken', '')
-        
+
         exp = decode_jwt_exp(at)
         if exp is None:
-            issues.append(f"{key}: cannot decode access token")
+            issues.append(f"{key} ({email}): cannot decode access token")
             continue
         
         remaining = exp - time.time()

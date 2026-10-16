@@ -14,3 +14,5 @@ providers*.json
 globalState.json
 
 nibs_tokens.json
+# Zen section runtime state (catalog churn tracking)
+zen-models-state.json

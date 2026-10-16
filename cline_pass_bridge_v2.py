@@ -373,7 +373,6 @@ def _models_payload():
     curated = (
         # Premium / subscription models (all covered by ClinePass sub)
         "cline-pass/kimi-k3",
-        "cline-pass/glm-5.2",
         "cline-pass/glm-5.3",
         "cline-pass/kimi-k2.7-code",
         "cline-pass/kimi-k2.6",
@@ -400,12 +399,14 @@ def _models_payload():
         # until a cline-free account lands in providers.json.
         "cline-pass/deepseek-v4.1-flash",
         "cline-free/muse-spark-1.3-contributor",
+        "cline-free/deepseek-v4.1-flash",
+        "stealth/space-bunny-alpha",
+        "cline-free/mimo-v2.6-flash",
         # Kali fleet sync 2026-09-18: match Windows 26-model catalog
         # (Drive guide "Catalog sync" line). Free-tier slugs serve on ANY
         # account (no sub needed) now that product-surface headers are in.
         "cline-free/solar-pro4",
         "cline-free/longcat-2.0",
-        "cline-free/glm-5.2",
         "stepfun/step-3.7-flash",
         "cline-pass/glm-5.3-flash",
         "z-ai/glm-5.3-flash",
