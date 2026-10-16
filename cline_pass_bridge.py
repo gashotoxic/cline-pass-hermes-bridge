@@ -14,7 +14,7 @@ v3 changes:
       ~/.cline/data/globalState.json  (model selection)
   - Backwards-compatible with old ~/.cline/data/settings/providers.json
   - Free-tier model names: cline:z-ai/glm-5.3-flash,
-    cline:deepseek/deepseek-v4-flash, cline-free/glm-5.2,
+    cline:deepseek/deepseek-v4-flash,
     stepfun/step-3.7-flash, poolside/laguna-s-2.1:free,
     minimax/minimax-m3, xiaomi/mimo-v2.5-pro
   - Subscription models: cline-pass/ (kimi, glm, deepseek, mimo,
@@ -36,11 +36,18 @@ How it works:
   5. Failure handling: 401 -> force refresh + retry; 429/5xx -> next account;
      if refresh dies (revoked/expired refresh token) re-run Cline extension login.
 
+Section B (2026-02-16): opencode Zen free tier under zen/<model-id> -
+anonymous client attestation (stream:true + a tool named "read" + opencode
+client headers), optional OpenCode Console API keys via ZEN_KEYS for
+round-robin per-account quota. Live model catalog with churn tracking in
+zen-models-state.json.
+
 Stdlib only. No pip installs required.
 """
 
 import json
 import os
+import random
 import shutil
 import sys
 import threading
@@ -81,12 +88,25 @@ LOG_FILE = os.environ.get("BRIDGE_LOG", os.path.join(BRIDGE_DIR, "bridge.log"))
 MAX_RETRIES = 3
 RETRY_BACKOFF = (1, 2, 4)  # seconds
 
+# ------------------------- Section B: opencode Zen -------------------------
+# Free tier = anonymous client attestation (no API key, no OAuth). Optional
+# OpenCode Console API keys (ZEN_KEYS, comma-separated) add per-account quota
+# with round-robin + failover and also unlock paid zen models.
+ZEN_ENABLED = os.environ.get("ZEN_ENABLED", "1") == "1"
+ZEN_BASE_URL = os.environ.get("ZEN_BASE_URL", "https://opencode.ai/zen/v1")
+ZEN_KEYS = []
+for _zk in os.environ.get("ZEN_KEYS", "").split(","):
+    _zk = _zk.strip()
+    if _zk and _zk not in ZEN_KEYS:
+        ZEN_KEYS.append(_zk)
+ZEN_CLIENT_VERSION = os.environ.get("ZEN_CLIENT_VERSION", "2.0.30")
+ZEN_CATALOG_TTL = int(os.environ.get("ZEN_CATALOG_TTL", "900"))  # 15 min
+
 # Models offered by the Cline free tier + legacy paid models
 # Model name mapping: bridge name -> upstream Cline API name
 # Some models are only available via Cline product surfaces and need
 # the upstream name to work through the bridge.
 MODEL_NAME_MAP = {
-    "cline-free/glm-5.2": "cline-pass/glm-5.2",
     "cline:z-ai/glm-5.3-flash": "cline-pass/glm-5.3-flash",
     # deepseek-v4-flash was removed upstream (404 on every form, confirmed
     # 2026-09-22); the alias now serves its successor v4.1-flash.
@@ -105,39 +125,58 @@ MODEL_NAME_MAP = {
 FREE_MODELS = [
     # cline: prefix = free / credits-based models (provider/model format)
     "cline:z-ai/glm-5.3-flash",
-    "cline:deepseek/deepseek-v4-flash",
+    "stealth/space-bunny-alpha",
     # free tier (per ClinePass Bridge Guide v2.0) — needs product-surface headers
     "cline-free/solar-pro4",
+    "cline-free/mimo-v2.6-flash",
     "cline-free/muse-spark-1.3-contributor",
     "cline-free/longcat-2.0",
-    "cline-free/glm-5.2",
     "stepfun/step-3.7-flash",
     "poolside/laguna-s-2.1:free",
-    "minimax/minimax-m3",
-    "xiaomi/mimo-v2.5-pro",
     # free-tier ids used by the Hermes config (verified 2026-09-22)
-    "cline-free/kimi-k3",
     "cline-free/deepseek-v4.1-flash",
 ]
 LEGACY_MODELS = [
     # cline-pass/ prefix = subscription models
     "cline-pass/deepseek-v4.1-flash",
     "cline-pass/kimi-k3",
-    "cline-pass/kimi-k2.6",
-    "cline-pass/kimi-k2.7-code",
-    "cline-pass/glm-5.2",
     "cline-pass/glm-5.3",
     "cline-pass/glm-5.3-flash",
-    "cline-pass/deepseek-v4-flash",
-    "cline-pass/deepseek-v4-pro",
-    "cline-pass/mimo-v2.5",
-    "cline-pass/mimo-v2.5-pro",
     "cline-pass/mimo-v2.6-pro",
-    "cline-pass/minimax-m3",
-    "cline-pass/qwen3.7-max",
-    "cline-pass/qwen3.7-plus",
     "cline-pass/qwen3.8-max",
 ]
+
+# Removal policy for the /v1/models catalog (2026-10-13). Removed models are
+# still accepted on /v1/chat/completions (requests pass through to upstream),
+# they are simply no longer advertised. Applied to the curated lists above
+# AND to the dynamic entries picked up from globalState.json / providers.json
+# so a stale account config cannot re-advertise a removed model.
+def _is_model_allowed(model_id):
+    """Return False for models pruned from the catalog, True otherwise."""
+    mid = (model_id or "").strip().lower()
+    base = mid.rsplit("/", 1)[-1]
+    # 1. QWEN: keep only 3.8 versions (qwen3.7-max/plus etc. removed)
+    if base.startswith("qwen") and not base.startswith("qwen3.8"):
+        return False
+    # 2. MIMO: drop 2.5 in every prefix form; keep 2.6
+    if base.startswith("mimo-v2.5"):
+        return False
+    # 3. DEEPSEEK: drop v4-flash / v4-pro; keep only the v4.1 family
+    if base.startswith("deepseek-v4") and not base.startswith("deepseek-v4.1"):
+        return False
+    # 4. KIMI: drop anything below k3 (kimi-k1/k2/k2.5/k2.6/k2.7-code ...)
+    if base.startswith("kimi-k") and not base.startswith("kimi-k3"):
+        return False
+    # 5. FREE duplicates of kimi-k3 / glm under cline-free/ only — the
+    #    cline:z-ai/glm-5.3-flash credits route stays advertised.
+    if mid.startswith("cline-free/") and (
+        base == "kimi-k3" or base.startswith("glm")
+    ):
+        return False
+    # 6. MINIMAX: drop in every prefix form (muse-spark is NOT minimax — kept)
+    if base.startswith("minimax"):
+        return False
+    return True
 
 
 def log(msg):
@@ -165,6 +204,367 @@ def _jwt_payload(token):
         return json.loads(urlsafe_b64decode(seg.encode()))
     except Exception:
         return {}
+
+
+# ===========================================================================
+# SECTION B: opencode Zen free tier (https://opencode.ai/zen/v1)
+# ===========================================================================
+# Recipe reverse-engineered 2026-02-16 by capturing opencode v2.0.30's own
+# requests (opencode serve + local listener) and replaying them with curl.
+# The free tier is anonymous client attestation - no API key, no OAuth:
+#
+#   User-Agent: opencode/latest/<ver>/cli       (version not pinned)
+#   x-opencode-client: cli
+#   x-opencode-session: ses_<9hex>ffe<14alnum>  (exact format, value free)
+#   Authorization: Bearer public                (or omit; or a Console key)
+#   body: stream: true
+#   body: tools[] contains a tool NAMED "read"  (schema/description free)
+#
+# Hard gates (each verified to hard-fail when violated):
+#   - stream:false                          -> FreeTierError
+#   - no tool named "read" in tools         -> FreeTierError
+#   - missing/misformatted session id       -> FreeTierError
+#   - foreign Authorization token           -> FreeTierError
+#     (pi/Hermes send "Bearer bridge-managed-oauth" - MUST be stripped here)
+#   - sibling session headers (x-opencode-session-id, x-session-affinity,
+#     x-session-id) with values != x-opencode-session -> FAIL (never sent)
+#
+# FreeTierError is ALSO emitted for transient shared-pool admission failures
+# (same id+recipe flips PASS<->FAIL across minutes; parallel + rapid bursts
+# pass). => retry with backoff; ZEN_KEYS console keys give per-account quota.
+# ===========================================================================
+
+ZEN_TOOL_GATE = {
+    "type": "function",
+    "function": {
+        "name": "read",
+        "description": "Compatibility placeholder. Do not call.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+# Last known-good catalog (verified 2026-02-16). Fallback only - the live
+# /models fetch + churn tracking in zen-models-state.json is the source of
+# truth, so new free models surface automatically and removals get logged.
+ZEN_STATIC_CATALOG = [
+    "glm-5.3-flash-free",
+    "deepseek-v4.1-flash-free",
+    "mimo-v2.6-flash-free",
+    "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3-contributor-free",
+    "nemotron-3.5-super-vl-free",
+    "nemotron-3.5-lightning-free",
+    "jev-1.13-free",
+    "longcat-2.5-preview-free",
+    "space-bunny-free",
+    "cat-jam-free",   # geo-blocked: NG/RU/CN/BY/IR/KP/SY/VE/CU/...
+    "ll-alpha-free",
+    "big-pickle",
+]
+
+ZEN_STATE_FILE = os.path.join(BRIDGE_DIR, "zen-models-state.json")
+_ZEN_ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+_zen_catalog_cache = {"ts": 0.0, "models": []}
+
+
+def _zen_mint_session():
+    """Session ids must match opencode's format: ses_<9hex>ffe<14alnum>."""
+    hexpart = "%09x" % random.getrandbits(36)
+    tail = "".join(random.choice(_ZEN_ALNUM) for _ in range(14))
+    return "ses_%sffe%s" % (hexpart, tail)
+
+
+class ZenKeyRotator:
+    """Round-robin + cooldown over optional OpenCode Console API keys."""
+
+    def __init__(self, keys):
+        self._keys = list(keys)
+        self._lock = threading.Lock()
+        self._counter = 0
+        self._cooldowns = {}
+
+    def has_keys(self):
+        return bool(self._keys)
+
+    def next_key(self):
+        with self._lock:
+            n = len(self._keys)
+            if n == 0:
+                return None
+            now = time.time()
+            for _ in range(n):
+                idx = self._counter % n
+                self._counter += 1
+                key = self._keys[idx]
+                if now >= self._cooldowns.get(key, 0):
+                    return key
+            return None  # all cooling down -> caller falls back to anonymous
+
+    def mark_failure(self, key, perm=False):
+        delay = PERM_FAIL_TIMEOUT if perm else COOLDOWN_SECONDS
+        self._cooldowns[key] = time.time() + delay
+        log("zen key ...%s cooling down for %ds%s" % (
+            key[-4:], delay, " (perm)" if perm else ""))
+
+    def ok_count(self):
+        now = time.time()
+        return sum(1 for k in self._keys if now >= self._cooldowns.get(k, 0))
+
+
+ZEN_ROTATOR = ZenKeyRotator(ZEN_KEYS)
+
+
+class ZenRetriable(Exception):
+    """Soft zen failure (flaky pool admission / 200-wrapped error) - retry."""
+
+
+def _zen_prepare(raw, model):
+    """Shape a client request into the attested zen form.
+
+    Returns (upstream_body_bytes, client_want_stream, injected_read).
+    """
+    body = json.loads(raw)
+    body["model"] = model  # strip the zen/ routing prefix before forwarding
+    want_stream = bool(body.get("stream"))
+    body["stream"] = True  # free tier hard-rejects stream:false
+    if not isinstance(body.get("stream_options"), dict):
+        body["stream_options"] = {"include_usage": True}
+    tools = body.get("tools")
+    has_read = isinstance(tools, list) and any(
+        isinstance(t, dict) and (t.get("function") or {}).get("name") == "read"
+        for t in tools
+    )
+    injected = False
+    if not has_read:
+        body["tools"] = (tools if isinstance(tools, list) else []) + [ZEN_TOOL_GATE]
+        injected = True
+    return json.dumps(body).encode(), want_stream, injected
+
+
+def _open_zen(path, raw_body, token, session_id):
+    req = urllib.request.Request(
+        ZEN_BASE_URL + path,
+        data=raw_body,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "User-Agent": "opencode/latest/%s/cli" % ZEN_CLIENT_VERSION,
+            "x-opencode-client": "cli",
+            "x-opencode-session": session_id,
+        },
+        method="POST",
+    )
+    return urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
+
+
+def _zen_sse_collect(resp, model):
+    """Accumulate an SSE stream and synthesize one chat.completion object.
+
+    The free tier rejects stream:false, so non-streaming clients get a
+    synthesized response. Merges delta.content, delta.reasoning_content and
+    delta.tool_calls (by index); keeps usage when present.
+    """
+    content_parts = []
+    reasoning_parts = []
+    tool_calls = {}
+    finish = None
+    usage = None
+    mid = None
+    created = None
+    buf = b""
+    while True:
+        chunk = resp.read(8192)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                continue
+            try:
+                evt = json.loads(data.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if not isinstance(evt, dict):
+                continue
+            mid = mid or evt.get("id")
+            created = created or evt.get("created")
+            if evt.get("usage"):
+                usage = evt["usage"]
+            for ch in evt.get("choices") or []:
+                d = ch.get("delta") or {}
+                if d.get("content"):
+                    content_parts.append(d["content"])
+                if d.get("reasoning_content"):
+                    reasoning_parts.append(d["reasoning_content"])
+                for tc in d.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = tool_calls.setdefault(idx, {
+                        "id": None, "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+                if ch.get("finish_reason"):
+                    finish = ch["finish_reason"]
+    message = {"role": "assistant", "content": "".join(content_parts) or None}
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+    out = {
+        "id": mid or "chatcmpl-zen-bridge",
+        "object": "chat.completion",
+        "created": created or int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish or "stop",
+        }],
+    }
+    if usage:
+        out["usage"] = usage
+    return json.dumps(out).encode("utf-8")
+
+
+def _zen_load_state():
+    try:
+        with open(ZEN_STATE_FILE, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {"models": {}}
+
+
+def _zen_save_state(state):
+    try:
+        tmp = ZEN_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, ZEN_STATE_FILE)
+    except OSError as exc:
+        log("zen state save failed: %s" % exc)
+
+
+def _zen_track_churn(live_ids):
+    """Diff the live catalog against zen-models-state.json.
+
+    New models and removals are logged, and first_seen / last_seen /
+    gone_since are kept per model, so catalog churn is auditable and new
+    free models appear in /v1/models on the next fetch without a restart.
+    Removed ids stay accepted on POST (pass-through - upstream decides).
+    """
+    state = _zen_load_state()
+    seen = state.setdefault("models", {})
+    now = int(time.time())
+    live = set(live_ids)
+    changed = False
+    for mid in live_ids:
+        ent = seen.get(mid)
+        if ent is None:
+            seen[mid] = {"first_seen": now, "last_seen": now}
+            log("zen catalog: NEW model %s" % mid)
+            changed = True
+        else:
+            if ent.get("gone_since"):
+                log("zen catalog: model %s returned (gone since %s)" % (
+                    mid, datetime.fromtimestamp(ent["gone_since"]).date()))
+                ent.pop("gone_since", None)
+                changed = True
+            if now - int(ent.get("last_seen", 0)) > 60:
+                ent["last_seen"] = now
+                changed = True
+    for mid, ent in seen.items():
+        if mid not in live and not ent.get("gone_since"):
+            ent["gone_since"] = now
+            log("zen catalog: REMOVED model %s (first seen %s)" % (
+                mid, datetime.fromtimestamp(int(ent.get("first_seen", now))).date()))
+            changed = True
+    if changed:
+        _zen_save_state(state)
+
+
+def _zen_fetch_live_catalog():
+    token = ZEN_ROTATOR.next_key() or "public"
+    req = urllib.request.Request(
+        ZEN_BASE_URL + "/models",
+        headers={
+            "Authorization": "Bearer " + token,
+            "Accept": "application/json",
+            "User-Agent": "opencode/latest/%s/cli" % ZEN_CLIENT_VERSION,
+            "x-opencode-client": "cli",
+            "x-opencode-session": _zen_mint_session(),
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.loads(resp.read().decode("utf-8", "replace"))
+    return [m["id"] for m in payload.get("data", [])
+            if isinstance(m, dict) and m.get("id")]
+
+
+def _zen_catalog():
+    """Live free-model catalog: 15-min cache, static fallback, churn-tracked."""
+    now = time.time()
+    if _zen_catalog_cache["models"] and now - _zen_catalog_cache["ts"] < ZEN_CATALOG_TTL:
+        return list(_zen_catalog_cache["models"])
+    try:
+        ids = _zen_fetch_live_catalog()
+    except Exception as exc:
+        log("zen catalog fetch failed: %s" % exc)
+        return list(_zen_catalog_cache["models"] or ZEN_STATIC_CATALOG)
+    filtered = sorted(
+        i for i in ids
+        if i != "test" and (i.endswith("-free") or i in ("big-pickle",))
+    )
+    _zen_track_churn(filtered)
+    _zen_catalog_cache["ts"] = now
+    _zen_catalog_cache["models"] = filtered
+    return list(filtered)
+
+
+def _zen_health():
+    return {
+        "enabled": ZEN_ENABLED,
+        "tier": "console-keys" if ZEN_ROTATOR.has_keys() else "anonymous",
+        "keys_total": len(ZEN_KEYS),
+        "keys_ok": ZEN_ROTATOR.ok_count(),
+        "catalog_size": len(_zen_catalog_cache["models"]),
+        "catalog_age_s": (int(time.time() - _zen_catalog_cache["ts"])
+                          if _zen_catalog_cache["ts"] else None),
+        "upstream": ZEN_BASE_URL,
+    }
+
+
+def _zen_self_check():
+    """Live probe through the full attestation path (used by --zen-check)."""
+    catalog = _zen_catalog()
+    model = ("glm-5.3-flash-free" if "glm-5.3-flash-free" in catalog
+             else (catalog[0] if catalog else "glm-5.3-flash-free"))
+    raw = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+        "max_completion_tokens": 8,
+    }).encode()
+    try:
+        upstream_raw, _, _ = _zen_prepare(raw, model)
+        resp = _open_zen("/chat/completions", upstream_raw,
+                         ZEN_ROTATOR.next_key() or "public", _zen_mint_session())
+        head = resp.read(64)
+        return head.lstrip().startswith(b"data:")
+    except Exception as exc:
+        print("zen probe error: %s" % exc)
+        return False
 
 
 # ----------------------------- account store (legacy providers.json) -------
@@ -645,7 +1045,7 @@ def _models_payload():
             gs = json.load(fh)
         for k in ("actModeClinePassModelId", "planModeClinePassModelId"):
             mid = gs.get(k)
-            if mid and mid not in seen:
+            if mid and mid not in seen and _is_model_allowed(mid):
                 seen.add(mid)
                 models.append(mid)
     except Exception:
@@ -658,7 +1058,7 @@ def _models_payload():
             if not key.startswith("cline-pass"):
                 continue
             mid = entry.get("settings", {}).get("model")
-            if mid and mid not in seen:
+            if mid and mid not in seen and _is_model_allowed(mid):
                 seen.add(mid)
                 models.append(mid)
     except Exception:
@@ -666,17 +1066,19 @@ def _models_payload():
 
     # Add free-tier and legacy fallbacks
     for mid in FREE_MODELS + LEGACY_MODELS:
-        if mid not in seen:
+        if mid not in seen and _is_model_allowed(mid):
             seen.add(mid)
             models.append(mid)
 
-    return {
-        "object": "list",
-        "data": [
-            {"id": m, "object": "model", "created": 0, "owned_by": "cline-pass"}
-            for m in models
-        ],
-    }
+    data = [
+        {"id": m, "object": "model", "created": 0, "owned_by": "cline-pass"}
+        for m in models
+    ]
+    if ZEN_ENABLED:
+        for zm in _zen_catalog():
+            data.append({"id": "zen/" + zm, "object": "model", "created": 0,
+                         "owned_by": "opencode-zen"})
+    return {"object": "list", "data": data}
 
 
 def _open_upstream(path, raw_body, token):
@@ -720,6 +1122,121 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ------------------------- Section B: opencode Zen ---------------------
+    def _handle_zen(self, model, raw):
+        """Route zen/<model> requests to opencode Zen. Never touches Cline state."""
+        if not ZEN_ENABLED:
+            self._send_json(404, {"error": {"message": "zen section disabled",
+                                            "type": "disabled"}})
+            return
+        if model not in _zen_catalog():
+            # Unknown to the live catalog: brand-new upstream model not yet
+            # cached, or a removed one. Pass through anyway - upstream decides.
+            log("zen/%s not in live catalog; passing through" % model)
+        try:
+            upstream_raw, want_stream, injected = _zen_prepare(raw, model)
+        except Exception as exc:
+            self._send_json(400, {"error": {"message": "invalid request body: %s" % exc,
+                                            "type": "invalid_request"}})
+            return
+        if injected:
+            log("zen/%s: injected compatibility 'read' tool" % model)
+
+        # Tier 1: console keys (round-robin). Tier 2: anonymous attestation.
+        attempts = []
+        seen_tokens = set()
+        for _ in range(len(ZEN_KEYS) + 1):
+            key = ZEN_ROTATOR.next_key()
+            if key is None or key in seen_tokens:
+                break
+            seen_tokens.add(key)
+            attempts.append(("key", key))
+        attempts.extend(("anon", "public") for _ in range(MAX_RETRIES))
+
+        last_code = 503
+        last_body = b'{"error":{"message":"zen unavailable","type":"upstream_error"}}'
+        retried = 0
+        for kind, token in attempts:
+            try:
+                resp = _open_zen("/chat/completions", upstream_raw, token,
+                                 _zen_mint_session())
+                ctype = resp.headers.get("Content-Type", "")
+                if "text/event-stream" not in ctype:
+                    # FreeTierError can arrive as a 200-wrapped JSON error.
+                    body = resp.read()
+                    if b'"error"' in body:
+                        raise ZenRetriable(body[:200].decode("utf-8", "replace"))
+                    # Unexpected non-SSE success: relay verbatim.
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", ctype or "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                log("zen/%s served (%s tier)" % (model, kind))
+                self._zen_relay(resp, model, want_stream)
+                return
+            except ZenRetriable as exc:
+                log("zen/%s soft failure (%s tier): %s" % (model, kind, exc))
+                retried += 1
+            except urllib.error.HTTPError as exc:
+                body = exc.read()
+                log("zen/%s upstream HTTP %s (%s tier): %s" % (
+                    model, exc.code, kind, body[:200].decode("utf-8", "replace")))
+                if kind == "key":
+                    ZEN_ROTATOR.mark_failure(token, perm=(exc.code == 401))
+                if b"FreeTierError" in body or exc.code in (
+                        401, 402, 403, 429, 500, 502, 503, 529):
+                    last_code, last_body = exc.code, body
+                    retried += 1
+                else:
+                    # Genuine client/model error (400/404/422...): surface as-is.
+                    self.send_response(exc.code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+            except Exception as exc:
+                log("zen/%s upstream error (%s tier): %s" % (model, kind, exc))
+                last_code, last_body = 502, json.dumps({"error": {
+                    "message": "zen upstream unreachable: %s" % exc,
+                    "type": "upstream_error"}}).encode()
+                retried += 1
+            if retried:
+                time.sleep(RETRY_BACKOFF[min(retried - 1, len(RETRY_BACKOFF) - 1)])
+
+        self.send_response(last_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(last_body)))
+        self.end_headers()
+        self.wfile.write(last_body)
+
+    def _zen_relay(self, resp, model, want_stream):
+        if want_stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.protocol_version = "HTTP/1.0"
+            self.close_connection = True
+            self.end_headers()
+            try:
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            body = _zen_sse_collect(resp, "zen/" + model)
+            log("zen/%s synthesized non-stream response (%d bytes)" % (model, len(body)))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path == "/health":
@@ -732,6 +1249,7 @@ class Handler(BaseHTTPRequestHandler):
                     "all_healthy": all_ok,
                     "accounts": accounts,
                     "upstream": UPSTREAM_BASE,
+                    "zen": _zen_health(),
                 })
             except Exception as exc:
                 self._send_json(503, {"ok": False, "error": str(exc)})
@@ -748,6 +1266,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length)
+        # --- Section B: opencode Zen free tier (zen/<model>) ----------------
+        # Branches BEFORE any Cline account logic; zen failures never touch
+        # Cline cooldowns/state. Foreign Authorization (pi/Hermes send
+        # "Bearer bridge-managed-oauth") is replaced inside _open_zen.
+        try:
+            _zen_model = json.loads(raw).get("model", "")
+        except Exception:
+            _zen_model = ""
+        if isinstance(_zen_model, str) and _zen_model.startswith("zen/"):
+            self._handle_zen(_zen_model[4:], raw)
+            return
+        # --------------------------------------------------------------------
         # Remap model name if needed (e.g. cline-free/* -> cline-pass/*)
         try:
             req_body = json.loads(raw)
@@ -982,6 +1512,10 @@ def _proactive_refresh_loop():
 
 def main():
     global STORE
+    if "--zen-check" in sys.argv:
+        ok = _zen_self_check()
+        print("zen probe: %s" % ("PASS" if ok else "FAIL"))
+        sys.exit(0 if ok else 1)
     STORE = MultiAccountStore(CLINE_SECRETS_JSON, CLINE_PROVIDERS_JSON)
 
     if "--check" in sys.argv:
@@ -1003,9 +1537,29 @@ def main():
         refresh_thread.start()
         log("proactive refresh thread started (checks every 60s, refreshes <5min before expiry)")
 
+    # Refuse to double-start (2026-09-28 pileup lesson: SO_REUSEADDR lets a
+    # second instance bind 8317 silently). If /health answers at all - even
+    # with an error status - another bridge is alive on this port; bail out.
+    try:
+        urllib.request.urlopen(
+            "http://%s:%d/health" % (LISTEN_HOST, LISTEN_PORT), timeout=3)
+        log("FATAL: another bridge instance already serves %s:%d; refusing to start" % (
+            LISTEN_HOST, LISTEN_PORT))
+        sys.exit(1)
+    except urllib.error.HTTPError as _he:
+        log("FATAL: %s:%d answered HTTP %s - another bridge instance is alive; "
+            "refusing to start" % (LISTEN_HOST, LISTEN_PORT, _he.code))
+        sys.exit(1)
+    except Exception:
+        pass  # connection refused etc. -> port is free
+
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     log("ClinePass v3 multi-account bridge listening on http://%s:%d/v1 -> %s" % (
         LISTEN_HOST, LISTEN_PORT, UPSTREAM_BASE))
+    log("zen section: %s (tier=%s, console keys=%d, upstream=%s)" % (
+        "enabled" if ZEN_ENABLED else "DISABLED",
+        "console-keys" if ZEN_ROTATOR.has_keys() else "anonymous",
+        len(ZEN_KEYS), ZEN_BASE_URL))
     for st in STORE.status():
         log("account: %s (%s) | access token expires in %ds" % (
             st["key"], st["email"], st["expires_in_seconds"]))

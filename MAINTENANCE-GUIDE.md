@@ -545,6 +545,69 @@ for k,v in d['providers'].items():
 
 ---
 
+## Zen Section (Section B — opencode Zen free tier, added 2026-02-16)
+
+Windows bridge only (`cline_pass_bridge.py`). Fronts `https://opencode.ai/zen/v1`
+under model ids `zen/<id>` on the same port 8317.
+
+### Health & probes
+
+```bash
+curl http://127.0.0.1:8317/health        # has a "zen" block: enabled/tier/keys/catalog
+python cline_pass_bridge.py --zen-check  # live attested probe, prints PASS/FAIL
+```
+
+### How it authenticates (no API key)
+
+Anonymous client attestation, reverse-engineered from opencode v2.0.30:
+opencode User-Agent + `x-opencode-client: cli` + session id in the exact
+`ses_<9hex>ffe<14alnum>` format + `stream: true` + a tool named `read` in the
+request body. The bridge shapes all of this; clients just send plain OpenAI
+requests. **Any `Authorization` header the client sends is stripped and
+replaced** — pi/Hermes send `Bearer bridge-managed-oauth`, which upstream
+hard-rejects.
+
+Hard gates (violating any -> `FreeTierError`): stream:false upstream, missing
+`read` tool, malformed/missing session id, foreign auth token, mismatched
+sibling session headers (bridge never sends those).
+
+### Model catalog churn (new models appear, old ones vanish)
+
+- Catalog is fetched **live** from `/zen/v1/models` every 15 min (cached),
+  filtered to `*-free` + allowlist. **New free models show up in the bridge's
+  `/v1/models` automatically** — no restart, no code change.
+- `zen-models-state.json` tracks `first_seen` / `last_seen` / `gone_since`
+  per model; additions and removals are logged to bridge.log
+  (`zen catalog: NEW model ...` / `REMOVED model ...`).
+- If the live fetch fails, a static fallback list is served. Unknown
+  `zen/<id>` requests are passed through anyway (upstream decides) — same
+  policy as removed Cline models.
+- **Downstream configs (pi `models.json`, Hermes) are static** — when the
+  bridge log shows a NEW model you want, add an entry there (id `zen/<id>`,
+  cost 0). Removed models should be pruned from those configs when the log
+  shows REMOVED.
+
+### Failure modes & fixes
+
+| Symptom | Meaning | What to do |
+|---------|---------|-----------|
+| `429 "Endpoint is unavailable"` on zen | Anonymous shared pool under pressure | Nothing — bridge retries with backoff; add `ZEN_KEYS` for dedicated quota |
+| Repeated `FreeTierError` on ALL zen requests | Upstream gate changed (recipe drift) | Run `--zen-check`; capture fresh opencode traffic; update attestation recipe; or set `ZEN_KEYS` (keyed path skips some gates) |
+| `zen upstream HTTP 403` on `cat-jam-free` | Geo-blocked model | Expected in NG/RU/CN/etc. — pick another model |
+| `zen/<id> not in live catalog; passing through` in log | New/removed model | Informational — check churn log |
+| Bridge won't start: `FATAL: another bridge instance already serves` | Duplicate-instance guard (pileup protection) | Kill the old pythonw first (see restart-bridge.ps1) |
+
+### Console keys tier (optional, recommended if anonymous tier gets flaky)
+
+Create free account(s) at console.opencode.ai, copy API key(s), set
+`ZEN_KEYS=key1,key2,key3` in the bridge environment and restart. Requests
+round-robin across keys with per-key cooldown failover (401 -> 1h, others ->
+60s); anonymous attestation stays as the final fallback tier. Keys also
+unlock paid zen models (billed) — the bridge catalog only advertises free
+ones.
+
+---
+
 ## WorkOS Token Lifecycle (IMPORTANT)
 
 ```

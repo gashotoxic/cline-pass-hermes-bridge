@@ -248,6 +248,51 @@ Environment variables (all optional):
 | `CLINE_API_BASE` | `https://api.cline.bot/api/v1` | Upstream API |
 | `REFRESH_MARGIN` | `180` | Seconds before expiry to refresh |
 | `BRIDGE_LOG` | `./bridge.log` | Log file path |
+| `ZEN_ENABLED` | `1` | `0` disables the zen section entirely |
+| `ZEN_KEYS` | _(empty)_ | Comma-separated OpenCode Console API keys: enables round-robin per-account quota tier (anonymous attestation remains as fallback) |
+| `ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | Zen upstream |
+| `ZEN_CLIENT_VERSION` | `2.0.30` | Version reported in the attestation User-Agent |
+| `ZEN_CATALOG_TTL` | `900` | Seconds between live zen catalog refreshes |
+
+## opencode Zen free tier (Section B, added 2026-02-16)
+
+The bridge also fronts the [opencode Zen](https://opencode.ai/zen) gateway's
+free model catalog under the `zen/` prefix, e.g. `zen/glm-5.3-flash-free`.
+Same endpoint, same OpenAI shape:
+
+```bash
+curl http://127.0.0.1:8317/v1/chat/completions \
+  -H "Authorization: Bearer anything" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"zen/glm-5.3-flash-free","messages":[{"role":"user","content":"hi"}]}'
+```
+
+How it works (reverse-engineered from opencode v2.0.30's own traffic): the
+free tier is **anonymous client attestation**, not an API key. The bridge
+replays the exact recipe upstream — opencode User-Agent, `x-opencode-client:
+cli`, a session id in opencode's `ses_<9hex>ffe<14alnum>` format,
+`stream: true`, and a tool named `read` (injected only when the client
+didn't define one). Any foreign `Authorization` header from the client is
+stripped and replaced. Non-streaming clients get a synthesized
+`chat.completion` assembled from the upstream SSE stream.
+
+- **Model catalog** is fetched live from `/zen/v1/models` every 15 min
+  (cached), filtered to free models. New free models appear in `/v1/models`
+  automatically on the next fetch; removals are logged. Churn history lives
+  in `zen-models-state.json` (first_seen / last_seen / gone_since per model).
+  If the live fetch fails, a static fallback list (verified 2026-02-16) is
+  used. Unknown `zen/<id>` models are passed through anyway — upstream
+  decides (same policy as removed Cline models).
+- **FreeTierError / 429s** happen on the anonymous shared pool (transient
+  admission pressure). The bridge retries with backoff; for dedicated quota,
+  create free OpenCode Console account(s) and set `ZEN_KEYS=key1,key2,...` —
+  requests then round-robin per account with cooldown failover, and the
+  anonymous recipe remains as the last-resort tier.
+- **Probe**: `python cline_pass_bridge.py --zen-check` runs a live
+  attested completion and prints PASS/FAIL.
+- `cat-jam-free` is geo-blocked upstream (NG, RU, CN, BY, IR, KP, SY, VE,
+  CU, ...); it stays listed and simply errors there.
+- Zen failures never touch Cline account state, cooldowns or status codes.
 
 ## Use with other clients
 
