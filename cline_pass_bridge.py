@@ -556,15 +556,20 @@ def _zen_self_check():
         "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
         "max_completion_tokens": 8,
     }).encode()
-    try:
-        upstream_raw, _, _ = _zen_prepare(raw, model)
-        resp = _open_zen("/chat/completions", upstream_raw,
-                         ZEN_ROTATOR.next_key() or "public", _zen_mint_session())
-        head = resp.read(64)
-        return head.lstrip().startswith(b"data:")
-    except Exception as exc:
-        print("zen probe error: %s" % exc)
-        return False
+    # Two attempts with a short pause: the anonymous shared pool emits
+    # transient 429/FreeTierError and a single-attempt probe would be noisy.
+    for attempt in range(2):
+        try:
+            upstream_raw, _, _ = _zen_prepare(raw, model)
+            resp = _open_zen("/chat/completions", upstream_raw,
+                             ZEN_ROTATOR.next_key() or "public", _zen_mint_session())
+            head = resp.read(64)
+            if head.lstrip().startswith(b"data:"):
+                return True
+        except Exception as exc:
+            print("zen probe attempt %d error: %s" % (attempt + 1, exc))
+        time.sleep(3)
+    return False
 
 
 # ----------------------------- account store (legacy providers.json) -------
