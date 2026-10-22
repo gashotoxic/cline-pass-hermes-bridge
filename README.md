@@ -280,9 +280,14 @@ stripped and replaced. Non-streaming clients get a synthesized
   (cached), filtered to free models. New free models appear in `/v1/models`
   automatically on the next fetch; removals are logged. Churn history lives
   in `zen-models-state.json` (first_seen / last_seen / gone_since per model).
-  If the live fetch fails, a static fallback list (verified 2026-02-16) is
+  If the live fetch fails, a static fallback list (verified 2026-10-21) is
   used. Unknown `zen/<id>` models are passed through anyway — upstream
   decides (same policy as removed Cline models).
+- **`ZEN_EXCLUDE`** hides models that upstream still lists but that cannot
+  work through the attestation path — currently `jev-1.13-free`, which
+  rejects tool definitions (`400 ModelProtocolUnsupported`) while the free
+  tier *requires* a tool named `read`. Hidden from `/v1/models`, still
+  accepted on POST.
 - **FreeTierError / 429s** happen on the anonymous shared pool (transient
   admission pressure). The bridge retries with backoff; for dedicated quota,
   create free OpenCode Console account(s) and set `ZEN_KEYS=key1,key2,...` —
@@ -290,8 +295,20 @@ stripped and replaced. Non-streaming clients get a synthesized
   anonymous recipe remains as the last-resort tier.
 - **Probe**: `python cline_pass_bridge.py --zen-check` runs a live
   attested completion and prints PASS/FAIL.
-- `cat-jam-free` is geo-blocked upstream (NG, RU, CN, BY, IR, KP, SY, VE,
-  CU, ...); it stays listed and simply errors there.
+- Some free models are geo-blocked upstream (e.g. the retired
+  `cat-jam-free` for NG, RU, CN, BY, IR, KP, SY, VE, CU); they stay listed
+  and simply error there.
+- **IP-reputation flag** (distinct from rate limiting): upstream can return
+  `403 FreeTierError: "...detected abusive traffic from this IP address"`.
+  This is scoped to the **public egress IP** of the connection — it is not
+  geographic (verified: two boxes in Nairobi, one flagged, one not) and not
+  per-account. It is also **free-tier only**: paid/console-key requests from
+  the same flagged IP return `401 AuthError: Missing API key`, i.e. they
+  clear the network gate and fail at credential validation instead. The flag
+  is usually temporary — re-probe later, or force a new dynamic IP.
+  Do not confuse it with the second 403 message, `"free tier can only be
+  used from within OpenCode"`, which means the *attestation recipe* broke
+  (missing `read` tool / wrong headers), not the IP.
 - Zen failures never touch Cline account state, cooldowns or status codes.
 
 ## Use with other clients

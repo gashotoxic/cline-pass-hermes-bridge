@@ -246,21 +246,29 @@ ZEN_TOOL_GATE = {
 # Last known-good catalog (verified 2026-02-16). Fallback only - the live
 # /models fetch + churn tracking in zen-models-state.json is the source of
 # truth, so new free models surface automatically and removals get logged.
+# Verified working 2026-10-21 (churn-swept). Removed since first wiring:
+#   muse-spark-1.2/1.3-contributor-free, space-bunny-free, cat-jam-free,
+#   ll-alpha-free   -> upstream 410 ModelDeprecated / unavailable
+# Deliberately NOT listed (still returned by the live /models endpoint but
+# unusable through the attestation path, so they stay pass-through only):
+#   jev-1.13-free              -> 400 ModelProtocolUnsupported (rejects tools;
+#                                 the 'read' tool is mandatory for free tier)
+#   longcat-2.5-preview-free   -> 429 "Endpoint is unavailable" (degraded)
 ZEN_STATIC_CATALOG = [
-    "glm-5.3-flash-free",
-    "deepseek-v4.1-flash-free",
+    "big-pickle",
+    "beam-free",
     "mimo-v2.6-flash-free",
-    "muse-spark-1.2-contributor-free",
-    "muse-spark-1.3-contributor-free",
     "nemotron-3.5-super-vl-free",
     "nemotron-3.5-lightning-free",
-    "jev-1.13-free",
-    "longcat-2.5-preview-free",
-    "space-bunny-free",
-    "cat-jam-free",   # geo-blocked: NG/RU/CN/BY/IR/KP/SY/VE/CU/...
-    "ll-alpha-free",
-    "big-pickle",
+    "deepseek-v4.1-flash-free",
+    "glm-5.3-flash-free",
+    "minimax-m3.1-flash-free",
 ]
+
+# jev-1.13-free rejects tool definitions (400 ModelProtocolUnsupported), but the
+# free tier requires a tool named "read" -> structurally incompatible, not a
+# transient failure. Everything else is left visible even when degraded.
+ZEN_EXCLUDE = {"jev-1.13-free"}
 
 ZEN_STATE_FILE = os.path.join(BRIDGE_DIR, "zen-models-state.json")
 _ZEN_ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
@@ -523,9 +531,13 @@ def _zen_catalog():
     except Exception as exc:
         log("zen catalog fetch failed: %s" % exc)
         return list(_zen_catalog_cache["models"] or ZEN_STATIC_CATALOG)
+    # ZEN_EXCLUDE: models upstream still lists but which cannot work through
+    # the attestation path. Hidden from /v1/models so downstream clients don't
+    # offer a guaranteed-to-fail option; still accepted on POST (pass-through).
     filtered = sorted(
         i for i in ids
-        if i != "test" and (i.endswith("-free") or i in ("big-pickle",))
+        if i != "test" and i not in ZEN_EXCLUDE
+        and (i.endswith("-free") or i in ("big-pickle",))
     )
     _zen_track_churn(filtered)
     _zen_catalog_cache["ts"] = now

@@ -592,8 +592,11 @@ sibling session headers (bridge never sends those).
 | Symptom | Meaning | What to do |
 |---------|---------|-----------|
 | `429 "Endpoint is unavailable"` on zen | Anonymous shared pool under pressure | Nothing — bridge retries with backoff; add `ZEN_KEYS` for dedicated quota |
+| `403 FreeTierError: "...abusive traffic from this IP address"` | IP-reputation flag on the connection's **public egress IP** (free tier only; not geo, not per-account) | Wait and re-probe (usually temporary), force a new dynamic IP, or route through a clean connection. Paid/console-key requests from the same IP are unaffected (`401` instead) |
+| `403 FreeTierError: "free tier can only be used from within OpenCode"` | Attestation recipe broken (missing `read` tool or wrong client headers) — **not** an IP block | Run `--zen-check`; verify `_zen_prepare` injects the `read` tool and `_open_zen` sends the opencode headers |
+| Model listed by upstream but always fails | Structurally incompatible or deprecated | `jev-1.13-free` rejects tools → in `ZEN_EXCLUDE`. `410 ModelDeprecated` → model is gone, prune it |
 | Repeated `FreeTierError` on ALL zen requests | Upstream gate changed (recipe drift) | Run `--zen-check`; capture fresh opencode traffic; update attestation recipe; or set `ZEN_KEYS` (keyed path skips some gates) |
-| `zen upstream HTTP 403` on `cat-jam-free` | Geo-blocked model | Expected in NG/RU/CN/etc. — pick another model |
+| `zen upstream HTTP 403` on a geo-blocked model | Geo-blocked (e.g. retired `cat-jam-free`) | Expected in NG/RU/CN/etc. — pick another model |
 | `zen/<id> not in live catalog; passing through` in log | New/removed model | Informational — check churn log |
 | Bridge won't start: `FATAL: another bridge instance already serves` | Duplicate-instance guard (pileup protection) | Kill the old pythonw first (see restart-bridge.ps1) |
 
