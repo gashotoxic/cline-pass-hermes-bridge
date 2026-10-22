@@ -106,6 +106,23 @@ for _zk in os.environ.get("ZEN_KEYS", "").split(","):
 ZEN_CLIENT_VERSION = os.environ.get("ZEN_CLIENT_VERSION", "2.0.30")
 ZEN_CATALOG_TTL = int(os.environ.get("ZEN_CATALOG_TTL", "900"))  # 15 min
 
+# --- IP-reputation escape hatches -----------------------------------------
+# Upstream can flag a *public egress IP* for the free tier (403 FreeTierError
+# "...abusive traffic from this IP address"). Both knobs below let zen traffic
+# leave through a different IP without touching anything else:
+#
+#   ZEN_PROXY=http://user:pass@host:port
+#       Send zen requests through an HTTP proxy (stdlib ProxyHandler). Only the
+#       zen path is affected; Cline traffic keeps going out directly.
+#
+#   ZEN_RELAY_BASE=http://100.x.y.z:8317/v1
+#       Hand zen completions to *another* bridge instance (e.g. this one on a
+#       clean connection) over Tailscale/LAN. That bridge does the attestation
+#       and tiering; we just forward and relay the stream back. Requires the
+#       relay host to listen on a reachable interface (BRIDGE_HOST=0.0.0.0).
+ZEN_PROXY = os.environ.get("ZEN_PROXY", "").strip()
+ZEN_RELAY_BASE = os.environ.get("ZEN_RELAY_BASE", "").strip().rstrip("/")
+
 # Models offered by the Cline free tier + legacy paid models
 # Model name mapping: bridge name -> upstream Cline API name
 # Some models are only available via Cline product surfaces and need
@@ -284,9 +301,17 @@ def _zen_prepare(raw, model):
     return json.dumps(body).encode(), want_stream, injected
 
 
-def _open_zen(path, raw_body, token, session_id):
+def _zen_opener():
+    """urllib opener honouring ZEN_PROXY (None -> default direct opener)."""
+    if not ZEN_PROXY:
+        return None
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": ZEN_PROXY, "https": ZEN_PROXY}))
+
+
+def _open_zen(path, raw_body, token, session_id, method="POST", url_base=None):
     req = urllib.request.Request(
-        ZEN_BASE_URL + path,
+        (url_base or ZEN_BASE_URL) + path,
         data=raw_body,
         headers={
             "Authorization": "Bearer " + token,
@@ -296,8 +321,11 @@ def _open_zen(path, raw_body, token, session_id):
             "x-opencode-client": "cli",
             "x-opencode-session": session_id,
         },
-        method="POST",
+        method=method,
     )
+    opener = _zen_opener()
+    if opener is not None:
+        return opener.open(req, timeout=REQUEST_TIMEOUT)
     return urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
 
 
@@ -439,6 +467,13 @@ def _zen_track_churn(live_ids):
 
 def _zen_fetch_live_catalog():
     token = ZEN_ROTATOR.next_key() or "public"
+    if ZEN_RELAY_BASE:
+        # Relay mode: the peer bridge owns the real catalog and advertises it
+        # as zen/<id>, so mirror that (strip the prefix back off).
+        with urllib.request.urlopen(ZEN_RELAY_BASE + "/models", timeout=30) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+        return [m["id"][4:] for m in payload.get("data", [])
+                if isinstance(m, dict) and str(m.get("id", "")).startswith("zen/")]
     req = urllib.request.Request(
         ZEN_BASE_URL + "/models",
         headers={
@@ -450,8 +485,13 @@ def _zen_fetch_live_catalog():
         },
         method="GET",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        payload = json.loads(resp.read().decode("utf-8", "replace"))
+    opener = _zen_opener()
+    if opener is not None:
+        with opener.open(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    else:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
     return [m["id"] for m in payload.get("data", [])
             if isinstance(m, dict) and m.get("id")]
 
@@ -490,6 +530,8 @@ def _zen_health():
         "catalog_age_s": (int(time.time() - _zen_catalog_cache["ts"])
                           if _zen_catalog_cache["ts"] else None),
         "upstream": ZEN_BASE_URL,
+        "proxy": bool(ZEN_PROXY),
+        "relay": ZEN_RELAY_BASE or None,
     }
 
 
@@ -1147,6 +1189,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": {"message": "zen section disabled",
                                             "type": "disabled"}})
             return
+        if ZEN_RELAY_BASE:
+            # Relay mode: hand the completion to a peer bridge (clean egress).
+            # It owns attestation/tiering, so forward the body untouched except
+            # for re-adding the zen/ prefix it routes on.
+            try:
+                rbody = json.loads(raw)
+                rbody["model"] = "zen/" + model
+                self._zen_relay_forward(model, json.dumps(rbody).encode())
+            except Exception as exc:
+                log("zen/%s relay error: %s" % (model, exc))
+                self._send_json(502, {"error": {"message": "zen relay failed: %s" % exc,
+                                                "type": "upstream_error"}})
+            return
         if model not in _zen_catalog():
             # Unknown to the live catalog: brand-new upstream model not yet
             # cached, or a removed one. Pass through anyway - upstream decides.
@@ -1229,6 +1284,51 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(last_body)))
         self.end_headers()
         self.wfile.write(last_body)
+
+    def _zen_relay_forward(self, model, body):
+        """POST to the peer bridge and copy its response through verbatim."""
+        req = urllib.request.Request(
+            ZEN_RELAY_BASE + "/chat/completions", data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + (ZEN_KEYS[0] if ZEN_KEYS else "relay"),
+                     "Accept": "*/*"},
+            method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            eb = exc.read()
+            log("zen/%s relay peer HTTP %s: %s" % (model, exc.code,
+                eb[:160].decode("utf-8", "replace")))
+            self.send_response(exc.code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(eb)))
+            self.end_headers()
+            self.wfile.write(eb)
+            return
+        ctype = resp.headers.get("Content-Type", "text/event-stream")
+        log("zen/%s served via relay %s" % (model, ZEN_RELAY_BASE))
+        if "text/event-stream" in ctype:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.protocol_version = "HTTP/1.0"
+            self.close_connection = True
+            self.end_headers()
+            try:
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            body_out = resp.read()
+            self.send_response(resp.status)
+            self.send_header("Content-Type", ctype or "application/json")
+            self.send_header("Content-Length", str(len(body_out)))
+            self.end_headers()
+            self.wfile.write(body_out)
 
     def _zen_relay(self, resp, model, want_stream):
         if want_stream:

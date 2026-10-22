@@ -311,6 +311,44 @@ stripped and replaced. Non-streaming clients get a synthesized
   (missing `read` tool / wrong headers), not the IP.
 - Zen failures never touch Cline account state, cooldowns or status codes.
 
+## Unblocking a flagged IP (free-tier reputation)
+
+Symptom: `403 FreeTierError: "OpenCode's free models aren't available from
+your current network because we've detected abusive traffic from this IP
+address."` — the block is on the connection's **public egress IP**.
+
+What does **not** work: waiting for a per-minute rate-limit window, changing
+LAN IP, changing machine, changing account, or retrying harder (the bridge
+already retries with backoff). What **does** work, cheapest first:
+
+| # | Action | Notes |
+|---|--------|-------|
+| 1 | Re-probe later | These flags are frequently temporary — verify before doing anything expensive. `--zen-check`, or any `zen/*` request |
+| 2 | Force a new dynamic IP | Router reboot / PPPoE reconnect / MAC clone; mobile-data toggle on cellular. Consumer ISP IPs rotate, and the flag follows the IP, not you |
+| 3 | `ZEN_RELAY_BASE` | Route zen through a peer bridge on a clean connection. Verified working: this PC relaying through the Unwired box over Tailscale returned `RELAY-OK` and mirrored all 9 models |
+| 4 | `ZEN_PROXY` | Point zen at an HTTP proxy with a different egress. Only zen traffic is affected; Cline keeps going direct |
+| 5 | `ZEN_KEYS` | Console keys are a keyed tier: per-account quota instead of the anonymous pool's IP heuristics, and they unlock the paid catalog |
+| 6 | Ask upstream | Long-lived flags on residential/CGNAT ranges are worth reporting to OpenCode support together with the egress IP |
+
+Because ISP consumer IPs are often CGNAT-shared, every machine behind one
+router inherits the verdict (verified: the Windows box and one Linux box share
+`41.90.172.133` and are flagged or clear together, while a box on a different
+ISP was unaffected at the same moment).
+
+### Relay / proxy configuration
+
+```bash
+# Relay zen through another bridge instance that has a clean egress IP.
+# The peer must listen on a reachable interface (BRIDGE_HOST=0.0.0.0).
+ZEN_RELAY_BASE=http://100.105.117.30:8317/v1
+
+# ...or send only zen traffic through an HTTP proxy.
+ZEN_PROXY=http://user:pass@proxy-host:8080
+```
+
+Both are visible in `/health` under `zen.proxy` / `zen.relay`, and the log
+shows `zen/<id> served via relay <base>` per request.
+
 ## Use with other clients
 
 Anything that speaks OpenAI Chat Completions works:

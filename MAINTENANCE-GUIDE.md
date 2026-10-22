@@ -592,7 +592,7 @@ sibling session headers (bridge never sends those).
 | Symptom | Meaning | What to do |
 |---------|---------|-----------|
 | `429 "Endpoint is unavailable"` on zen | Anonymous shared pool under pressure | Nothing — bridge retries with backoff; add `ZEN_KEYS` for dedicated quota |
-| `403 FreeTierError: "...abusive traffic from this IP address"` | IP-reputation flag on the connection's **public egress IP** (free tier only; not geo, not per-account) | Wait and re-probe (usually temporary), force a new dynamic IP, or route through a clean connection. Paid/console-key requests from the same IP are unaffected (`401` instead) |
+| `403 FreeTierError: "...abusive traffic from this IP address"` | IP-reputation flag on the connection's **public egress IP** (free tier only; not geo, not per-account) | Usually temporary — re-probe first. Then: force a new dynamic IP, or set `ZEN_RELAY_BASE`/`ZEN_PROXY` to egress elsewhere. Paid/console-key requests from a flagged IP return `401` instead, i.e. are unaffected |
 | `403 FreeTierError: "free tier can only be used from within OpenCode"` | Attestation recipe broken (missing `read` tool or wrong client headers) — **not** an IP block | Run `--zen-check`; verify `_zen_prepare` injects the `read` tool and `_open_zen` sends the opencode headers |
 | Model listed by upstream but always fails | Structurally incompatible or deprecated | `jev-1.13-free` rejects tools → in `ZEN_EXCLUDE`. `410 ModelDeprecated` → model is gone, prune it |
 | Repeated `FreeTierError` on ALL zen requests | Upstream gate changed (recipe drift) | Run `--zen-check`; capture fresh opencode traffic; update attestation recipe; or set `ZEN_KEYS` (keyed path skips some gates) |
@@ -601,7 +601,6 @@ sibling session headers (bridge never sends those).
 | Bridge won't start: `FATAL: another bridge instance already serves` | Duplicate-instance guard (pileup protection) | Kill the old pythonw first (see restart-bridge.ps1) |
 
 ### Console keys tier (optional, recommended if anonymous tier gets flaky)
-
 Create free account(s) at console.opencode.ai, copy API key(s), set
 `ZEN_KEYS=key1,key2,key3` in the bridge environment and restart. Requests
 round-robin across keys with per-key cooldown failover (401 -> 1h, others ->
