@@ -39,6 +39,11 @@ if ($still) {
 }
 
 # 3. Start exactly one fresh instance (silent, detached)
+# 2026-10-22: zen anonymous tier is rate-limited on the Safaricom IP this PC
+# shares with gashoteck. Relay all zen traffic through gashotech (Unwired
+# ISP, different egress IP) over Tailscale. Only zen is diverted; Cline
+# requests keep going out directly.
+$env:ZEN_RELAY_BASE = 'http://100.105.117.30:8317/v1'
 $pythonw = 'C:\Users\Gasho\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\pythonw.exe'
 Start-Process -FilePath $pythonw `
     -ArgumentList "`"$bridgeDir\cline_pass_bridge.py`"" `
